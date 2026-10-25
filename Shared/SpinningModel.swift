@@ -19,6 +19,13 @@ struct SpinningModel: PlatformViewRepresentable {
     /// Called once the model is loaded and on the GPU, when it can appear
     /// without a hitch.
     var onReady: (() -> Void)? = nil
+    /// The camera's vertical view angle in degrees. Wider shows the model
+    /// smaller in the same view.
+    var fieldOfView: CGFloat = 35
+    #if os(macOS)
+    /// A click that lands on no part of the model.
+    var onEmptyClick: (() -> Void)? = nil
+    #endif
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -33,10 +40,17 @@ struct SpinningModel: PlatformViewRepresentable {
     private func update(_ view: SCNView, _ coordinator: Coordinator) {
         show(url, in: view, coordinator)
         view.isPlaying = isPlaying
+        #if os(macOS)
+        (view as? PinchableSCNView)?.onEmptyClick = onEmptyClick
+        #endif
     }
 
     private func makeView(_ coordinator: Coordinator) -> SCNView {
+        #if os(macOS)
+        let view: SCNView = PinchableSCNView()
+        #else
         let view = SCNView()
+        #endif
         view.backgroundColor = .clear
         view.antialiasingMode = .multisampling4X
         view.allowsCameraControl = true
@@ -51,9 +65,13 @@ struct SpinningModel: PlatformViewRepresentable {
         guard view.scene?.rootNode.name != url.path else { return }
         let scene = Self.scene(for: url)
         let camera = scene.rootNode.childNode(withName: "camera", recursively: false)
+        camera?.camera?.fieldOfView = fieldOfView
         view.scene = scene
         view.pointOfView = camera
         view.defaultCameraController.target = SCNVector3Zero
+        #if os(macOS)
+        (view as? PinchableSCNView)?.rememberHome()
+        #endif
         coordinator.watch(camera: camera, turntable: scene.rootNode.childNode(withName: "turntable", recursively: false),
                           headlight: scene.rootNode.childNode(withName: "headlight", recursively: false))
         // Uploads the textures and geometry and builds the shaders now,
@@ -133,6 +151,92 @@ struct SpinningModel: PlatformViewRepresentable {
         return scene
     }
 }
+
+#if os(macOS)
+/// SpinningModel's view on the Mac, zooming the way a browser zooms a page:
+/// a trackpad pinch zooms towards the pointer, so what's under it stays
+/// under it, and a two-finger double tap zooms in on that spot or back out.
+/// Dragging still turns the model, through SceneKit's camera control.
+final class PinchableSCNView: SCNView {
+    var onEmptyClick: (() -> Void)?
+    /// The camera and its place as first shown, for zooming back out.
+    private var home: (camera: SCNNode, transform: simd_float4x4)?
+    /// How far in the pinches have zoomed, 1 when it's as first shown.
+    private var magnification: Float = 1
+    private var mouseDownAt: NSPoint?
+
+    func rememberHome() {
+        home = pointOfView.map { ($0, $0.simdTransform) }
+        magnification = 1
+    }
+
+    override func magnify(with event: NSEvent) {
+        zoom(by: 1 + Float(event.magnification), at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func smartMagnify(with event: NSEvent) {
+        if magnification > 1.05 {
+            zoomOut()
+        } else {
+            SCNTransaction.begin()
+            SCNTransaction.animationDuration = 0.3
+            zoom(by: 2.5, at: convert(event.locationInWindow, from: nil))
+            SCNTransaction.commit()
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        mouseDownAt = event.locationInWindow
+        super.mouseDown(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        super.mouseUp(with: event)
+        defer { mouseDownAt = nil }
+        // A click, not a drag to turn, on nothing but the clear background.
+        guard let down = mouseDownAt,
+              hypot(event.locationInWindow.x - down.x, event.locationInWindow.y - down.y) < 4,
+              hitTest(convert(event.locationInWindow, from: nil), options: nil).isEmpty else { return }
+        onEmptyClick?()
+    }
+
+    /// Moves the camera along the line through `point` (in this view's
+    /// coordinates), so the model grows by `factor` there. The point SceneKit
+    /// turns the model round moves sideways with it, so turning afterwards
+    /// carries on round what's being looked at.
+    private func zoom(by factor: Float, at point: NSPoint) {
+        guard factor > 0, let camera = pointOfView else { return }
+        defaultCameraController.stopInertia()
+        let near = unprojectPoint(SCNVector3(point.x, point.y, 0))
+        let far = unprojectPoint(SCNVector3(point.x, point.y, 1))
+        let ray = simd_normalize(SIMD3(Float(far.x - near.x), Float(far.y - near.y), Float(far.z - near.z)))
+        let eye = camera.simdWorldPosition, front = camera.simdWorldFront
+        let centre = defaultCameraController.target
+        let target = SIMD3(Float(centre.x), Float(centre.y), Float(centre.z))
+        // How far ahead the turning point is, before and after.
+        let depth = simd_dot(target - eye, front), along = simd_dot(ray, front)
+        guard depth > 1e-3, along > 1e-3 else { return }
+        let newDepth = min(max(depth / factor, 0.4), 16)
+        let step = ray * ((depth - newDepth) / along)
+        camera.simdWorldPosition = eye + step
+        defaultCameraController.target = SCNVector3(target + step - front * simd_dot(step, front))
+        magnification *= depth / newDepth
+    }
+
+    /// Back to the camera as first shown.
+    private func zoomOut() {
+        guard let home else { return }
+        defaultCameraController.stopInertia()
+        pointOfView = home.camera
+        SCNTransaction.begin()
+        SCNTransaction.animationDuration = 0.3
+        home.camera.simdTransform = home.transform
+        SCNTransaction.commit()
+        defaultCameraController.target = SCNVector3Zero
+        magnification = 1
+    }
+}
+#endif
 
 #if canImport(UIKit)
 typealias PlatformColor = UIColor

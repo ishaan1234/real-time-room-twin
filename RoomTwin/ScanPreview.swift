@@ -27,6 +27,7 @@ struct ScanPreview: View {
     @StateObject private var voice = VoiceAgent()
     @StateObject private var hand = HandInteractionController()
     @State private var arCamera = ARCameraFollower()
+    @State private var handCamera = HandCameraFollower()
     @EnvironmentObject private var account: Account
     @State private var showingMyObjects = false
     @State private var draggedLibraryObject: ObjectLibrarySelection?
@@ -44,16 +45,28 @@ struct ScanPreview: View {
     /// Whether the walk drag under way moves a gizmo handle; nil until it's begun.
     @State private var isDraggingGizmo: Bool?
     @State private var gizmoMode = PreviewScene.GizmoMode.move
+    @State private var snappingEnabled = false
+    /// Scale handles move together (see PreviewScene.scalesUniformly).
+    @State private var scaleLocked = false
+    /// An object from the Add panel is downloading.
+    @State private var isAdding = false
 
     var body: some View {
         ZStack {
             PreviewSceneView(scene: scene, mode: mode)
                 .simultaneousGesture(selectTap)
                 .ignoresSafeArea()
-            if mode == .walk {
+            if mode == .walk, !hand.isEnabled {
                 Color.clear
                     .contentShape(Rectangle())
                     .gesture(look)
+                    .simultaneousGesture(selectTap)
+                    .ignoresSafeArea()
+            } else if mode == .walk {
+                // The phone supplies look direction while hand tracking is
+                // active. Keep tapping available for ordinary object editing.
+                Color.clear
+                    .contentShape(Rectangle())
                     .simultaneousGesture(selectTap)
                     .ignoresSafeArea()
             }
@@ -80,11 +93,11 @@ struct ScanPreview: View {
                 .padding(.top, 8)
                 if mode == .walk, handTracking { handControls }
                 Spacer()
-                if let message = hand.feedback {
-                    Text(message)
-                        .font(.footnote.bold())
+                if isAdding {
+                    // Something is downloading to be added: no words, just that it's coming.
+                    ProgressView()
                         .padding(10)
-                        .background(.regularMaterial, in: Capsule())
+                        .background(.regularMaterial, in: Circle())
                 } else if let message = notice {
                     Text(message)
                         .font(.footnote)
@@ -109,9 +122,11 @@ struct ScanPreview: View {
                     }
                 }
                 if selection != nil { objectEditor }
-                Text(modeHint)
-                    .font(.caption)
-                    .foregroundStyle(.white.opacity(0.6))
+                if let hint = modeHint {
+                    Text(hint)
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.6))
+                }
                 // Poly Haven's terms ask for this wherever its content shows; CC BY asks for each credit.
                 Text(([PolyHaven.credit] + credits.suffix(2)).joined(separator: " · "))
                     .font(.caption2)
@@ -180,19 +195,37 @@ struct ScanPreview: View {
             scene.move = .zero
             onARModeChanged(newMode == .ar)
             arCamera.follow(newMode == .ar ? arSession : nil, in: scene)
+            if newMode != .walk {
+                handCamera.stop()
+                scene.endHandCameraFollow()
+            }
             hand.setAvailable(handTracking && newMode == .walk)
+        }
+        .onChange(of: hand.isEnabled) { _, enabled in
+            if enabled, mode == .walk {
+                scene.beginHandCameraFollow()
+                handCamera.follow(hand.camera.session, in: scene)
+            } else {
+                handCamera.stop()
+                scene.endHandCameraFollow()
+            }
         }
         // The gizmo shows on the piece the editor is for.
         .onChange(of: selection) { _, selected in scene.showsGizmo = selected != nil }
         .onChange(of: gizmoMode) { _, tool in scene.gizmoMode = tool }
+        .onChange(of: snappingEnabled) { _, enabled in scene.snappingEnabled = enabled }
         .animation(.easeInOut(duration: 0.2), value: voice.caption)
         .animation(.easeInOut(duration: 0.2), value: voice.heard)
         .onAppear {
+            snappingEnabled = scene.snappingEnabled
             voice.perform = { try await perform($0, $1) }
+            scene.scalesUniformly = scaleLocked
             voice.describeRoom = {
                 let names = scene.furnitureNames
-                return names.isEmpty ? "The room has no editable objects right now."
-                    : "Editable objects in the room right now: \(names.suffix(40).joined(separator: ", "))."
+                let inventory = names.isEmpty ? "The room has no editable objects right now."
+                    : "Whole-room editable names, for resolving edit targets only (do not claim all are visible): "
+                        + names.suffix(40).joined(separator: ", ") + "."
+                return scene.describeCurrentView() + "\n" + inventory
             }
             hand.configure(scene: scene)
             hand.onSelection = { name in
@@ -203,6 +236,8 @@ struct ScanPreview: View {
         .onDisappear {
             onARModeChanged(false)
             arCamera.stop()
+            handCamera.stop()
+            scene.endHandCameraFollow()
             hand.stop()
             scene.clearSelection()
             Task { await voice.stop() }
@@ -214,16 +249,11 @@ struct ScanPreview: View {
         }
     }
 
-    private var modeHint: String {
+    /// A line of help under the controls; Walk has none, to keep the room clear.
+    private var modeHint: String? {
         switch mode {
         case .orbit: "Drag to turn · pinch to zoom · two fingers to pan"
-        case .walk where hand.isEnabled:
-            switch hand.tracking {
-            case .off, .searching: "Hold your free hand up behind the phone, in the back camera's view"
-            case .found: "Point at an object · pinch to grab"
-            case .holding: "Move your hand · open your fingers to drop"
-            }
-        case .walk: "Tap an object to edit · stick to walk · drag to look"
+        case .walk: nil
         case .ar: "Tap an object to edit · move the phone to look round"
         }
     }
@@ -258,7 +288,6 @@ struct ScanPreview: View {
                 Button("Undo", systemImage: "arrow.uturn.backward") {
                     if let name = scene.undoLastEdit() {
                         selection = name
-                        notice = "Undid hand move."
                         editRevision += 1
                     }
                 }
@@ -267,7 +296,6 @@ struct ScanPreview: View {
                 Button("Redo", systemImage: "arrow.uturn.forward") {
                     if let name = scene.redoLastEdit() {
                         selection = name
-                        notice = "Redid hand move."
                         editRevision += 1
                     }
                 }
@@ -324,11 +352,12 @@ struct ScanPreview: View {
                     if let name = scene.undoLastEdit() { selection = name }
                 }
                 Button("Remove", systemImage: "trash", role: .destructive) {
-                    if let removed = scene.removeFurniture(named: selection) {
-                        notice = "Removed \(removed)."
-                        selection = nil
-                    }
+                    if scene.removeFurniture(named: selection) != nil { selection = nil }
                 }
+                Button("Snapping", systemImage: snappingEnabled ? "magnet.fill" : "magnet") {
+                    snappingEnabled.toggle()
+                }
+                .foregroundStyle(snappingEnabled ? Color.blue : Color.primary)
                 Button("Done", systemImage: "checkmark") {
                     scene.clearSelection()
                     selection = nil
@@ -337,30 +366,29 @@ struct ScanPreview: View {
             .labelStyle(.iconOnly)
             .buttonStyle(.bordered)
             .controlSize(.small)
-            Picker("Tool", selection: $gizmoMode) {
-                Text("Move").tag(PreviewScene.GizmoMode.move)
-                Text("Rotate").tag(PreviewScene.GizmoMode.rotate)
-                Text("Scale").tag(PreviewScene.GizmoMode.scale)
+            HStack(spacing: 8) {
+                Picker("Tool", selection: $gizmoMode) {
+                    Text("Move").tag(PreviewScene.GizmoMode.move)
+                    Text("Rotate").tag(PreviewScene.GizmoMode.rotate)
+                    Text("Scale").tag(PreviewScene.GizmoMode.scale)
+                }
+                .pickerStyle(.segmented)
+                if gizmoMode == .scale {
+                    // Locked, every scale handle scales the whole piece evenly.
+                    Button(scaleLocked ? "Unlock axes" : "Lock axes",
+                           systemImage: scaleLocked ? "lock.fill" : "lock.open") {
+                        scaleLocked.toggle()
+                        scene.scalesUniformly = scaleLocked
+                    }
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .foregroundStyle(scaleLocked ? Color.blue : Color.primary)
+                }
             }
-            .pickerStyle(.segmented)
-            HStack(spacing: 10) {
-                axisKey("X", .red)
-                axisKey("Y", .green)
-                axisKey("Z", .blue)
-                Text(gizmoMode == .scale ? "· middle cube scales evenly" : "· drag a handle")
-                    .foregroundStyle(.secondary)
-            }
-            .font(.caption2)
         }
         .padding(10)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-    }
-
-    private func axisKey(_ name: String, _ colour: Color) -> some View {
-        HStack(spacing: 3) {
-            Circle().fill(colour).frame(width: 7, height: 7)
-            Text(name).bold()
-        }
     }
 
     private func add(_ selection: ObjectLibrarySelection, at point: CGPoint? = nil) {
@@ -376,13 +404,13 @@ struct ScanPreview: View {
 
     /// Places a saved object where the user taps or drops it.
     private func add(_ object: Account.SavedObject, at point: CGPoint?) async {
-        notice = "Fetching \(object.name)…"
+        isAdding = true
+        defer { isAdding = false }
         do {
             let file = try await account.modelFile(for: object)
             let model = try await Task.detached { try ModelLoader.load(file) }.value
             model.name = object.name
-            let place = try point.map { try scene.place(model, at: $0) } ?? scene.place(model)
-            notice = "Added \(object.name) \(place)."
+            _ = try point.map { try scene.place(model, at: $0) } ?? scene.place(model)
         } catch {
             notice = "Couldn't add \(object.name): \(error.localizedDescription)"
         }
@@ -392,12 +420,12 @@ struct ScanPreview: View {
     /// furniture-sized one metre; the existing free scale controls can adjust
     /// it immediately after placement.
     private func add(_ object: Sketchfab.Model, at point: CGPoint?) async {
-        notice = "Fetching \(object.name)…"
+        isAdding = true
+        defer { isAdding = false }
         do {
             let model = try await Sketchfab.model(object, height: 1)
-            let place = try point.map { try scene.place(model, at: $0) } ?? scene.place(model)
+            _ = try point.map { try scene.place(model, at: $0) } ?? scene.place(model)
             if !credits.contains(object.attribution) { credits.append(object.attribution) }
-            notice = "Added \(object.name) \(place)."
         } catch {
             notice = "Couldn't add \(object.name): \(error.localizedDescription)"
         }
@@ -436,22 +464,26 @@ struct ScanPreview: View {
             default: .inView
             }
         }
-        switch tool {
-        case "add_object":
-            guard let query = text("query") else { throw VoiceAgent.Failure(message: "Say what to add.") }
-            let placement = requestedPlacement()
-            let facing: PreviewScene.Facing? = switch text("facing") {
+        func requestedFacing() -> PreviewScene.Facing? {
+            switch text("facing") {
             case "user": .viewer
             case "away_from_wall": .awayFromWall
             case "toward_wall": .towardWall
             case "same_as_reference": .sameAsReference
             default: nil
             }
+        }
+        switch tool {
+        case "inspect_view":
+            return scene.describeCurrentView()
+        case "add_object":
+            guard let query = text("query") else { throw VoiceAgent.Failure(message: "Say what to add.") }
+            let placement = requestedPlacement()
             let height = (parameters["height_m"] as? NSNumber)?.floatValue ?? 0.9
             let found = try await FurnitureSearch.find(query, height: height,
                                                        from: FurnitureSearch.Source(rawValue: text("source") ?? "") ?? .any)
             let (lo, hi) = found.model.boundingBox
-            let place = try scene.place(found.model, placement, facing: facing,
+            let place = try scene.place(found.model, placement, facing: requestedFacing(),
                                         elevation: number("elevation_m"))
             if let credit = found.credit { credits.append(credit) }
             return String(format: "Added “%@” from %@, %.1f m wide and %.1f m tall, %@.", found.model.name ?? query,
@@ -487,15 +519,20 @@ struct ScanPreview: View {
             let height = number("height_m") ?? 0.9
             let found = try await FurnitureSearch.find(query, height: height,
                                                        from: FurnitureSearch.Source(rawValue: text("source") ?? "") ?? .any)
-            let name = try scene.replaceFurniture(named: text("name"), with: found.model)
+            let replacement = try scene.replaceFurniture(named: text("name"), with: found.model,
+                                                          facing: requestedFacing(),
+                                                          againstWall: text("placement") == "against_wall")
             if let credit = found.credit { credits.append(credit) }
-            return "Replaced it with “\(name)” from \(found.source)."
+            return "Replaced it with “\(replacement)” from \(found.source)."
         case "set_wall_texture":
             guard let query = text("query"), let asset = try await PolyHaven.wallTextures(matching: query).first else {
                 throw VoiceAgent.Failure(message: "Couldn't find a wall texture like that.")
             }
             let texture = try await PolyHaven.wallTexture(asset)
-            let count = try scene.setWallTexture(texture.image, size: texture.size, wallsInView: text("walls") == "in_view")
+            let reference = RoomEditMetadata.MaterialReference(assetID: asset.id, name: asset.name,
+                                                               size: [texture.size.x, texture.size.y])
+            let count = try scene.setWallTexture(texture.image, size: texture.size,
+                                                 wallsInView: text("walls") == "in_view", reference: reference)
             return "Covered \(count == 1 ? "the wall" : "\(count) walls") with “\(asset.name)” from Poly Haven."
         case "reset_walls":
             try scene.setWallTexture(nil)
@@ -505,7 +542,9 @@ struct ScanPreview: View {
                 throw VoiceAgent.Failure(message: "Couldn't find a floor material like that.")
             }
             let texture = try await PolyHaven.wallTexture(asset)
-            try scene.setGroundTexture(texture.image, size: texture.size)
+            try scene.setGroundTexture(texture.image, size: texture.size,
+                                       reference: .init(assetID: asset.id, name: asset.name,
+                                                        size: [texture.size.x, texture.size.y]))
             return "Covered the floor with “\(asset.name)” from Poly Haven."
         case "reset_floor":
             try scene.setGroundTexture(nil)
@@ -515,7 +554,9 @@ struct ScanPreview: View {
                 throw VoiceAgent.Failure(message: "Couldn't find an object material like that.")
             }
             let texture = try await PolyHaven.wallTexture(asset)
-            let name = try scene.setFurnitureTexture(texture.image, named: text("name"))
+            let name = try scene.setFurnitureTexture(texture.image, named: text("name"),
+                                                     reference: .init(assetID: asset.id, name: asset.name,
+                                                                      size: [texture.size.x, texture.size.y]))
             return "Covered “\(name)” with “\(asset.name)” from Poly Haven."
         case "resize_object":
             guard let height = number("height_m") else {
@@ -686,6 +727,35 @@ private final class ARCameraFollower: NSObject {
 
     @objc private func tick() {
         if let frame = session?.currentFrame { scene?.updateARCamera(frame) }
+    }
+}
+
+/// Keeps the virtual Walk camera on the hand-tracking ARSession's device pose
+/// at display cadence. Vision can remain throttled to 15 Hz independently.
+private final class HandCameraFollower: NSObject {
+    private var link: CADisplayLink?
+    private weak var session: ARSession?
+    private weak var scene: PreviewScene?
+
+    func follow(_ session: ARSession, in scene: PreviewScene) {
+        stop()
+        self.session = session
+        self.scene = scene
+        let link = CADisplayLink(target: self, selector: #selector(tick))
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+        link.add(to: .main, forMode: .common)
+        self.link = link
+    }
+
+    func stop() {
+        link?.invalidate()
+        link = nil
+        session = nil
+        scene = nil
+    }
+
+    @objc private func tick() {
+        if let frame = session?.currentFrame { scene?.updateHandCamera(frame) }
     }
 }
 

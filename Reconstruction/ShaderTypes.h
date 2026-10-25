@@ -62,6 +62,9 @@ typedef struct {
     float maxDepth;
     float maxWeight;
     float refineThreshold;
+    float colorBand;               // metres from the surface within which a voxel takes colour
+    float maxColorWeight;          // colour's running-average weight cap, in frames
+    float colorWeight;             // this frame's say in colour: 1 sharp, 0 blurred
     uint32_t minConfidence;
     uint32_t frameIndex;
     uint32_t hashMask;

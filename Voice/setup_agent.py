@@ -40,13 +40,27 @@ and fetches models from online libraries (Poly Haven, and Sketchfab for what Pol
 This is a one-shot command interface. Handle exactly one user instruction per conversation. Do not \
 greet, acknowledge, narrate your work, ask a follow-up question, or speak before calling a tool. Make \
 the best safe interpretation immediately. After the tool finishes, reply with one brief natural sentence \
-of roughly 4 to 12 words that confirms the actual result, for example: "Done — I moved the table to \
+of roughly 8 to 18 words that confirms the actual result, for example: "Done — I moved the table to \
 the left." On failure, give one short useful sentence such as "I couldn't find a table to move." Then stop.
 
 Each conversation may start with a contextual update listing what the user asked earlier in this session \
 and what the app did, plus the editable objects in the room now. Those earlier commands are already done: \
 never repeat them. Use them to resolve the new instruction ("make it bigger", "another one", "move that \
 lamp left", "put the sofa back"), and use the object names exactly as listed.
+
+Corrections: "no", "that is wrong", "you did not do it", and similar rejection refer to the most recent \
+edit in the contextual history. Do not merely apologize or ask what to do. Retry the relevant tool once, \
+combining the earlier request with any new detail. If a catalogue replacement is rejected without new \
+style detail, inspect the current view, keep the target's transform, and retry with a more specific query \
+that reflects the earlier request (for example "modern flat screen smart LED television").
+
+Vision and the current viewport: the context distinguishes the CURRENT VIEWPORT from the WHOLE-ROOM \
+editable-name list. Never claim that every object in the whole-room list is in front of the user. For \
+questions such as "what is in front of me?", "what do you see?", or "do you see a television?", call \
+inspect_view and answer only from its result. It reports reconstructed editable geometry visible through \
+the current Orbit, Walk, or AR viewport; it is not a live semantic camera description. If the user asks \
+to edit "this" object or replace an unnamed object in front of them, call inspect_view first and pass its \
+centre object's exact name to the edit tool. If there is no centre object, say so briefly; do not guess.
 
 Adding: call add_object once per piece.
 - query: a short catalogue search, the thing plus the user's style words ("floor lamp", \
@@ -76,7 +90,11 @@ matches and downloads it; never search Poly Haven or Sketchfab for a user-owned 
 
 RoomPlan's scanned furniture is editable too. The user can refer to it by category ("table", "chair 2").
 Moving: move_object with left, right, forward, backward, up or down relative to the user's current view.
-Replacing: replace_object names the existing scanned or added object and searches for its replacement.
+Replacing: replace_object names the existing scanned or added object and searches for its replacement. Keep \
+all of the user's style words in query: "modern flat screen television" must not become merely "television". \
+The default preserves the old object's exact position and direction. Use placement against_wall only when \
+the user asks to put, lean, back, mount, or align it against a wall. Use facing away_from_wall for "face out", \
+toward_wall for "face the wall", or user for "face me"; otherwise use preserve.
 Removing: remove_object with the name or kind ("the lamp"); with no name it removes the latest editable object.
 Walls: set_wall_texture with a short material search ("red brick", "white plaster", \
 "wood panels"); walls is all unless they mean the one they're looking at ("this wall"). \
@@ -91,7 +109,7 @@ room; brightness and warmth are both 0 to 1 (warmth 1 is warm amber, 0 is cool d
 
 Tool results contain implementation details for your decision only. Never read those details aloud. \
 Never mention tools, model sources, dimensions, credits, or how the app works. The final spoken reply \
-must remain one concise sentence, normally 4 to 12 words, and say what changed.
+must remain one concise but informative sentence, normally 8 to 18 words, and say what changed.
 """
 
 
@@ -129,6 +147,16 @@ def tools():
         return {"type": "string", "description": description, **({"enum": choices} if choices else {})}
 
     return {
+        "ELEVENLABS_INSPECT_VIEW_TOOL_ID": {
+            "type": "client",
+            "name": "inspect_view",
+            "description": "Reports only editable objects actually visible in the current rendered viewport, "
+                           "including the object directly under the screen centre. Always use for questions "
+                           "about what is in front, visible, or under the user's gaze.",
+            "expects_response": True,
+            "response_timeout_secs": 10,
+            "parameters": {"type": "object", "required": [], "properties": {}},
+        },
         "ELEVENLABS_ADD_OBJECT_TOOL_ID": {
             "type": "client",
             "name": "add_object",
@@ -197,13 +225,18 @@ def tools():
         "ELEVENLABS_REPLACE_OBJECT_TOOL_ID": {
             "type": "client",
             "name": "replace_object",
-            "description": "Replaces a scanned or added object with a catalogue model in the same position.",
+            "description": "Replaces a scanned or added object with a catalogue model, preserving its exact "
+                           "position and direction unless placement or facing is explicitly requested.",
             "expects_response": True,
             "response_timeout_secs": 30,
             "parameters": {"type": "object", "required": ["query", "height_m"], "properties": {
                 "name": text("The existing object to replace, e.g. 'table' or 'chair 2'."),
-                "query": text("Catalogue search for the replacement."),
+                "query": text("Specific catalogue search retaining every requested style word."),
                 "height_m": {"type": "number", "description": "Replacement's typical real height in metres."},
+                "placement": text("Keep the old position unless the user explicitly asks for the wall.",
+                                  ["same_position", "against_wall"]),
+                "facing": text("Keep the old direction unless the user explicitly requests another.",
+                               ["preserve", "user", "away_from_wall", "toward_wall"]),
                 "source": text("Which library to use.", ["any", "polyhaven", "sketchfab"]),
             }},
         },

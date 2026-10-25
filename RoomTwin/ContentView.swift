@@ -9,6 +9,7 @@ struct ContentView: View {
     @StateObject private var walk = WalkAroundCapture()
     @StateObject private var sender = ModelSender()
     @StateObject private var roomPlan = RoomPlanScan()
+    @StateObject private var hybrid = HybridScan()
     @State private var mode = Mode.room
     /// Asking which kind of room scan to start.
     @State private var choosingScan = false
@@ -46,8 +47,19 @@ struct ContentView: View {
                 MetalView(view: scan.view)
                     .ignoresSafeArea()
             }
+            if mode == .room, roomPlan.isCleanMode, roomPlan.phase == .capturing {
+                CleanFurnitureStatusOverlay(indicators: roomPlan.cleanFurnitureIndicators)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+            }
             if (mode == .photo && objects.photo != nil) || (mode == .walkAround && walk.session == nil) {
                 // Hides the live camera while a photo is up or a model is being built.
+                Color.black.ignoresSafeArea()
+            }
+            if mode == .room, hybrid.outputMode.usesManualFurnitureCapture,
+               hybrid.phase == .processing || hybrid.phase == .failed {
+                // The live detailed capture is not the final replacement
+                // result. Keep it private until the selected room is complete.
                 Color.black.ignoresSafeArea()
             }
             VStack(spacing: 0) {
@@ -55,6 +67,8 @@ struct ContentView: View {
                 switch mode {
                 case .room where roomPlan.phase != .idle:
                     RoomPlanControls(scan: roomPlan)
+                case .room where hybrid.phase != .idle:
+                    hybridControls
                 case .room:
                     roomControls
                 case .photo:
@@ -135,8 +149,9 @@ struct ContentView: View {
                 .id(opened.model)
                 .transition(.opacity)
         } else if mode == .photo, let model = objects.revealURL {
-            ModelReveal(model: model, backdrop: objects.photo, origin: objects.tap ?? CGPoint(x: 0.5, y: 0.5),
-                        sender: sender, onAR: { arModel = model }, onClose: { objects.revealURL = nil })
+            ModelReveal(model: model, backdrop: objects.photo, origin: objects.selectionOrigin,
+                        sender: sender, onAR: { arModel = model }, onClose: { objects.revealURL = nil },
+                        savedName: objects.libraryName)
                 .id(model)
                 .transition(.opacity)
         } else if mode == .walkAround, let model = walk.revealURL {
@@ -175,7 +190,7 @@ struct ContentView: View {
         }
         .padding(4)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
-        .disabled(scan.isBusy || roomPlan.isBusy)
+        .disabled(scan.isBusy || roomPlan.isBusy || hybrid.isBusy)
         .padding(.top, 8)
         .animation(.easeInOut(duration: 0.2), value: mode == .room)
         .sheet(isPresented: $showingSavedObjects) {
@@ -189,7 +204,8 @@ struct ContentView: View {
     private var roomControls: some View {
         VStack {
             if scan.hasStarted {
-                StatsBar(stats: scan.stats, isScanning: scan.isScanning)
+                StatsBar(stats: scan.stats, isScanning: scan.isScanning,
+                         isHybrid: scan.profile == .hybrid)
             }
             Spacer()
             if let hint = scan.trackingHint {
@@ -200,6 +216,7 @@ struct ContentView: View {
                     .background(.regularMaterial, in: Capsule())
                     .transition(.opacity)
             }
+            if let stage = detailedStage { ProcessingProgress(stage: stage) }
             if scan.hasStarted {
                 controls
             } else {
@@ -224,11 +241,21 @@ struct ContentView: View {
             .foregroundStyle(.white)
             .background(Color.red, in: Capsule())
             .confirmationDialog("What kind of scan?", isPresented: $choosingScan, titleVisibility: .visible) {
-                Button("Detailed Mesh", action: scan.startScanning)
+                Button("Detailed Mesh") { scan.startScanning() }
                 Button("Room Layout (RoomPlan)", action: roomPlan.start)
+                Button("Hybrid · Clean RoomPlan + Scan Colours") {
+                    hybrid.start(with: scan, account: account, outputMode: .semanticRoom)
+                }
+                Button("Clean · RoomPlan + SAM Replacements") {
+                    roomPlan.startClean(account: account)
+                }
+                Button("SAM Furniture · Detailed Room + Detected Replacements") {
+                    hybrid.start(with: scan, account: account, outputMode: .samFurnitureReplacement)
+                }
             } message: {
                 Text("Detailed Mesh captures every surface in colour. Room Layout finds the walls, doors, windows "
-                     + "and furniture, and fills in furniture from your library.")
+                     + "and furniture. Hybrid rebuilds RoomPlan with scan colours. Clean shows RoomPlan's full capture "
+                     + "animation, runs no detailed mesh, and adds manual SAM replacements. SAM Furniture preserves detailed geometry.")
             }
             Button("Saved Rooms", systemImage: "icloud.and.arrow.down") { showingSavedRooms = true }
                 .font(.subheadline.weight(.semibold))
@@ -243,6 +270,38 @@ struct ContentView: View {
                 try await roomPlan.open(layout, from: account)
             }
         }
+    }
+
+    /// What the detailed scanner is busy with after scanning, for the progress
+    /// bar. Both take longer the more there is, so they're timed per hundred
+    /// thousand triangles.
+    private var detailedStage: ProcessingProgress.Stage? {
+        let work = max(Double(scan.stats.triangles) / 100_000, 1)
+        if scan.isPreparingPreview {
+            return .init(title: "Building the 3D view", key: "preview", guess: 0.8, work: work)
+        }
+        if scan.isExporting {
+            return .init(title: "Exporting", key: "export", guess: 1.2, work: work)
+        }
+        return nil
+    }
+
+    /// The rest of a Hybrid scan's processing, after RoomPlan's part.
+    private var hybridStage: ProcessingProgress.Stage? {
+        let work = max(Double(scan.stats.triangles) / 100_000, 1)
+        if scan.isPreparingPreview {
+            let title = hybrid.outputMode == .samFurnitureReplacement
+                ? "Building the detailed room preview"
+                : hybrid.outputMode == .clean
+                    ? "Building the clean textured room"
+                    : "Fitting objects and building the 3D view"
+            return .init(title: title, key: "hybrid-preview",
+                         range: 0.55...1, guess: 1, work: work)
+        }
+        if scan.isExporting {
+            return .init(title: "Exporting", key: "export", guess: 1.2, work: work)
+        }
+        return nil
     }
 
     private var controls: some View {
@@ -262,17 +321,151 @@ struct ContentView: View {
                 .disabled(scan.isBusy)
         }
     }
+
+    private var hybridControls: some View {
+        VStack(spacing: 10) {
+            StatsBar(stats: scan.stats, isScanning: scan.isScanning, isHybrid: true)
+            if let summary = hybrid.summary {
+                Text(summary)
+                    .font(.footnote)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(.regularMaterial, in: Capsule())
+            }
+            if hybrid.outputMode.usesManualFurnitureCapture,
+               let photos = scan.samFurniturePhotoSummary,
+               hybrid.phase == .capturing {
+                Label(photos, systemImage: "camera.viewfinder")
+                    .font(.footnote)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(.regularMaterial, in: Capsule())
+            }
+            Spacer()
+            if let instruction = hybrid.instruction {
+                Label(instruction, systemImage: "viewfinder")
+                    .font(.footnote)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(.regularMaterial, in: Capsule())
+            }
+            if let message = hybrid.errorMessage {
+                Text(message)
+                    .font(.footnote)
+                    .multilineTextAlignment(.center)
+                    .padding(10)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    .onTapGesture { hybrid.errorMessage = nil }
+            }
+            switch hybrid.phase {
+            case .capturing:
+                HStack(spacing: 8) {
+                    ControlButton(title: "Cancel", systemImage: "xmark") { hybrid.close(with: scan) }
+                    ControlButton(title: scan.viewMode.label, systemImage: scan.viewMode.systemImage,
+                                  action: scan.cycleViewMode)
+                    if hybrid.outputMode.usesManualFurnitureCapture {
+                        SAMPhotoButton(enabled: scan.samFurnitureCanCapture && scan.isScanning) {
+                            scan.captureSAMFurniturePhoto()
+                        }
+                    } else {
+                        ControlButton(title: scan.isScanning ? "Mesh Pause" : "Mesh Scan",
+                                      systemImage: scan.isScanning ? "pause.fill" : "record.circle",
+                                      prominent: true, action: scan.toggleScanning)
+                    }
+                    ControlButton(title: "Finish", systemImage: "checkmark", prominent: true) {
+                        hybrid.finish(with: scan)
+                    }
+                }
+            case .processing:
+                if let progress = hybrid.processingProgress {
+                    DeterminateProcessingProgress(progress: progress)
+                } else {
+                    ProcessingProgress(stage: .init(title: "Finishing the room layout",
+                                                    key: "hybrid-roomplan", range: 0...0.55, guess: 6))
+                }
+            case .done:
+                if let stage = hybridStage {
+                    ProcessingProgress(stage: stage)
+                } else if let extracted = scan.hybridExtractionSummary {
+                    VStack(spacing: 4) {
+                        Text(extracted)
+                    }
+                    .font(.footnote)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(.regularMaterial, in: Capsule())
+                }
+                HStack(spacing: 8) {
+                    ControlButton(title: "New Scan", systemImage: "arrow.counterclockwise") {
+                        hybrid.close(with: scan)
+                    }
+                    ControlButton(title: scan.isPreparingPreview ? "Loading" : "View", systemImage: "view.3d",
+                                  action: scan.openPreview)
+                        .disabled(scan.isBusy || scan.stats.triangles == 0)
+                    ControlButton(title: scan.isExporting ? "Saving" : "Export",
+                                  systemImage: "square.and.arrow.up", action: scan.export)
+                        .disabled(scan.isBusy)
+                }
+            case .failed:
+                VStack(spacing: 10) {
+                    Text(hybrid.summary ?? "Replacement did not finish.")
+                        .font(.footnote)
+                        .multilineTextAlignment(.center)
+                    HStack(spacing: 8) {
+                        ControlButton(title: "New Scan", systemImage: "arrow.counterclockwise") {
+                            hybrid.close(with: scan)
+                        }
+                        ControlButton(title: "Retry", systemImage: "arrow.clockwise", prominent: true) {
+                            hybrid.retry(with: scan)
+                        }
+                    }
+                }
+                .padding(12)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+            case .idle:
+                EmptyView()
+            }
+        }
+        .padding()
+    }
+}
+
+private struct SAMPhotoButton: View {
+    let enabled: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Image(systemName: "camera.fill").font(.title3)
+                Text("Photo").font(.caption)
+            }
+            .frame(width: 64, height: 52)
+        }
+        .foregroundStyle(enabled ? Color.black : Color.secondary)
+        .background(enabled ? AnyShapeStyle(Color.yellow) : AnyShapeStyle(.regularMaterial),
+                    in: RoundedRectangle(cornerRadius: 12))
+        .disabled(!enabled)
+    }
 }
 
 private struct StatsBar: View {
     let stats: ReconstructionStats
     let isScanning: Bool
+    var isHybrid = false
 
     var body: some View {
         VStack(spacing: 4) {
             Text("\(compact(stats.triangles)) triangles · \(compact(stats.vertices)) vertices · \(compact(stats.blocks)) blocks")
             Text(isScanning ? String(format: "%.1f ms GPU per frame", stats.gpuMilliseconds) : "Paused")
                 .foregroundStyle(.secondary)
+            if isHybrid {
+                Text(String(format: "%.0f FPS · %.0f fusion/s · %@ · %.0f MB",
+                            stats.framesPerSecond, stats.integrationsPerSecond,
+                            thermalLabel, stats.memoryMegabytes))
+                    .foregroundStyle(stats.thermalState >= 2 ? .orange : .secondary)
+            }
             if stats.overflow != 0 {
                 Text("Memory full: export or reset to keep scanning")
                     .foregroundStyle(.orange)
@@ -287,6 +480,15 @@ private struct StatsBar: View {
     private func compact(_ n: Int) -> String {
         n >= 1_000_000 ? String(format: "%.1fM", Double(n) / 1e6)
             : n >= 1_000 ? String(format: "%.0fk", Double(n) / 1e3) : "\(n)"
+    }
+
+    private var thermalLabel: String {
+        switch stats.thermalState {
+        case 1: "thermal fair"
+        case 2: "thermal serious"
+        case 3: "thermal critical"
+        default: "thermal nominal"
+        }
     }
 }
 

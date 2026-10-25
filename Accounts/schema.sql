@@ -53,8 +53,11 @@ create table if not exists public.room_layouts (
     model_path text not null,
     ply_path text not null,
     json_path text not null,
+    edits_path text,
     created_at timestamptz not null default now()
 );
+-- Backward-compatible migration for projects created before edit metadata.
+alter table public.room_layouts add column if not exists edits_path text;
 alter table public.room_layouts enable row level security;
 grant select, insert, delete on public.room_layouts to authenticated;
 
@@ -68,9 +71,10 @@ drop policy if exists "own room layouts: delete" on public.room_layouts;
 create policy "own room layouts: delete" on public.room_layouts
     for delete to authenticated using (owner = auth.uid());
 
--- A detailed room can be larger than a single scanned object.
+-- Kept for rooms saved by older builds. New builds write complete room files
+-- to the Google Drive folder chosen in the app and store only their paths here.
 insert into storage.buckets (id, name, public, file_size_limit)
-values ('room-layouts', 'room-layouts', false, 157286400)
+values ('room-layouts', 'room-layouts', false, 52428800)
 on conflict (id) do update set public = false, file_size_limit = excluded.file_size_limit;
 
 drop policy if exists "own room layout files: read" on storage.objects;

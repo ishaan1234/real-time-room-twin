@@ -39,6 +39,11 @@ def main():
 
     positions, _, faces = scan_io.read_ply(scan_io.latest_mesh(args.scan_dir))
     keyframes = {kf.index: kf for kf in scan_io.load_keyframes(args.scan_dir)}
+    targets = scan_io.roomplan_targets(args.scan_dir)
+    if targets:
+        lift_roomplan_targets(args.scan_dir, positions, faces, keyframes, targets,
+                              args.min_vertices, args.min_ratio)
+        return
     n = len(positions)
 
     # Pass 1: votes per vertex, and the vertices inside each instance mask.
@@ -164,6 +169,108 @@ def main():
     with open(os.path.join(args.scan_dir, "objects.json"), "w") as f:
         json.dump(objects, f, indent=1)
     print(f"lift: {len(objects)} objects, {np.count_nonzero(vertex_objects >= 0)} of {n} vertices assigned")
+
+
+def lift_roomplan_targets(scan_dir, positions, faces, keyframes, targets, min_vertices, min_ratio):
+    """Assigns scan vertices to explicit RoomPlan furniture instances.
+
+    Unlike the legacy category/connected-component path, this cannot invent a
+    new chair or merge two nearby chairs: every output object must have one
+    RoomPlan target id and stay inside that target's expanded OBB.
+    """
+    n = len(positions)
+    target_by_id = {target["id"]: target for target in targets}
+    seen = {target["id"]: np.zeros(n, np.uint16) for target in targets}
+    votes = {target["id"]: np.zeros(n, np.uint16) for target in targets}
+    instances = []
+
+    for kf in keyframes.values():
+        segments = scan_io.load_segments(scan_dir, kf.index)
+        if segments is None:
+            continue
+        visible, ui, vi = kf.visible(positions)
+        ids = np.flatnonzero(visible).astype(np.int32)
+        target_members = {}
+        for target in targets:
+            members = ids[scan_io.points_in_target(positions[ids], target, margin=0.08)]
+            target_members[target["id"]] = members
+            seen[target["id"]][members] += 1
+        for instance, (label, score, mask, target_id) in enumerate(zip(
+                segments["labels"], segments["scores"], segments["masks"], segments["target_ids"])):
+            target_id = int(target_id)
+            if target_id not in target_by_id:
+                continue
+            candidates = target_members[target_id]
+            inside = mask[vi[candidates], ui[candidates]]
+            members = candidates[inside]
+            votes[target_id][members] += 1
+            clipped = mask[0].any() or mask[-1].any() or mask[:, 0].any() or mask[:, -1].any()
+            instances.append(dict(frame=kf.index, instance=instance, target=target_id,
+                                  score=float(score), members=members, clipped=bool(clipped)))
+
+    floor_y = scan_io.estimate_floor(positions, faces)
+    target_ids = [target["id"] for target in targets]
+    accepted = []
+    for target_id in target_ids:
+        # SAM Furniture capture intentionally records exactly one high-quality
+        # frame after at least 80% of a stable RoomPlan box enters the viewport.
+        enough = (seen[target_id] >= 1) & (votes[target_id] >= min_ratio * np.maximum(seen[target_id], 1))
+        enough &= positions[:, 1] >= floor_y + scan_io.FLOOR_MARGIN
+        accepted.append(enough)
+    table = np.stack([votes[target_id] for target_id in target_ids], axis=1)
+    label = np.full(n, -1, np.int32)
+    if len(target_ids):
+        best = table.argmax(axis=1)
+        for column, mask in enumerate(accepted):
+            label[mask & (best == column)] = column
+
+    vertex_objects = np.full(n, -1, np.int32)
+    objects = []
+    debug_dir = os.path.join(scan_dir, "debug")
+    os.makedirs(debug_dir, exist_ok=True)
+    for column, target in enumerate(targets):
+        members = np.flatnonzero(label == column)
+        if len(members) < min_vertices:
+            print(f"lift: RoomPlan target {target['id']} {target['category']} has only {len(members)} vertices; skipped")
+            continue
+        in_object = np.zeros(n, bool)
+        in_object[members] = True
+        best_view, best_score = None, 0.0
+        for inst in instances:
+            if inst["target"] != target["id"] or not len(inst["members"]):
+                continue
+            overlap = in_object[inst["members"]].sum()
+            precision = overlap / len(inst["members"])
+            coverage = overlap / len(members)
+            score = coverage * precision * inst["score"] * (0.3 if inst["clipped"] else 1.0)
+            if score > best_score:
+                best_view = dict(inst, precision=float(precision), coverage=float(coverage))
+                best_score = score
+        if best_view is None:
+            print(f"lift: RoomPlan target {target['id']} {target['category']} has no usable photo; skipped")
+            continue
+        object_id = len(objects)
+        vertex_objects[members] = object_id
+        p = positions[members]
+        objects.append(dict(
+            id=object_id, category=target["category"], roomplan_target=target["id"],
+            roomplan_identifier=target["identifier"], vertices=int(len(members)),
+            frame=best_view["frame"], instance=best_view["instance"], label=target["prompt"],
+            view_score=round(float(best_score), 4), coverage=round(best_view["coverage"], 3),
+            precision=round(best_view["precision"], 3), clipped=best_view["clipped"],
+            centroid=p.mean(axis=0).round(4).tolist(), bbox_min=p.min(axis=0).round(4).tolist(),
+            bbox_max=p.max(axis=0).round(4).tolist()))
+        save_debug_view(os.path.join(debug_dir, f"object_{object_id:02d}_{target['category'].replace(' ', '_')}.jpg"),
+                        keyframes[best_view["frame"]], scan_io.load_segments(scan_dir, best_view["frame"]),
+                        best_view["instance"], positions[members])
+        print(f"lift: target {target['id']:2d} -> object {object_id:2d} {target['category']:12s} "
+              f"{len(members):6d} vertices, keyframe {best_view['frame']}")
+
+    np.save(os.path.join(scan_dir, "vertex_objects.npy"), vertex_objects)
+    with open(os.path.join(scan_dir, "objects.json"), "w") as f:
+        json.dump(objects, f, indent=1)
+    print(f"lift: {len(objects)} of {len(targets)} RoomPlan targets ready; "
+          f"{np.count_nonzero(vertex_objects >= 0)} of {n} vertices assigned")
 
 
 def save_debug_view(path, kf, segments, instance, object_points):

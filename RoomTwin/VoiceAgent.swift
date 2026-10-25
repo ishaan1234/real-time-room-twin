@@ -59,6 +59,10 @@ final class VoiceAgent: ObservableObject {
     /// Talk is one-shot: one committed user utterance, one short answer, then
     /// the connection closes as soon as playback finishes.
     private var receivedCommand = false
+    /// A socket can drop just after LiveKit joins. Retry that once only while
+    /// no utterance has been accepted; retrying an in-flight command could
+    /// perform the same room edit twice.
+    private var automaticReconnectUsed = false
 
     private static let configFile = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("voice-agent.json")
@@ -95,7 +99,12 @@ final class VoiceAgent: ObservableObject {
 
     func toggle() {
         Task {
-            if status == .off { await start() } else { await stop() }
+            if status == .off {
+                automaticReconnectUsed = false
+                await start()
+            } else {
+                await stop()
+            }
         }
     }
 
@@ -203,11 +212,15 @@ final class VoiceAgent: ObservableObject {
                         status = .speaking
                         idleStop?.cancel()
                     }
-                case .ended:
-                    finish()
+                case .ended(let reason):
+                    if reason == .userEnded || caption != nil {
+                        finish()
+                    } else {
+                        handleUnexpectedEnd("The voice connection ended unexpectedly.", temporary: true)
+                    }
                 case .error(let error):
-                    errorMessage = "The voice agent stopped: \(error.localizedDescription)"
-                    finish()
+                    handleUnexpectedEnd("The voice agent stopped: \(error.localizedDescription)",
+                                        temporary: Self.isTemporaryConnectionError(error))
                 }
             }
             .store(in: &subscriptions)
@@ -219,6 +232,27 @@ final class VoiceAgent: ObservableObject {
                 }
             }
             .store(in: &subscriptions)
+    }
+
+    private func handleUnexpectedEnd(_ message: String, temporary: Bool) {
+        let hadCommand = receivedCommand
+        let failedConversation = conversation
+        let retry = !hadCommand && !automaticReconnectUsed && temporary
+        finish()
+        if retry {
+            automaticReconnectUsed = true
+            errorMessage = "The voice connection dropped. Reconnecting once…"
+            Task {
+                await failedConversation?.endConversation()
+                try? await Task.sleep(for: .milliseconds(700))
+                guard self.status == .off else { return }
+                await self.start()
+            }
+        } else if hadCommand {
+            errorMessage = "The voice connection dropped before the result was confirmed. Tap Talk and try again."
+        } else {
+            errorMessage = message
+        }
     }
 
     private func remember(_ line: String) {
@@ -283,7 +317,8 @@ final class VoiceAgent: ObservableObject {
         guard let error else { return false }
         let message = error.localizedDescription.lowercased()
         return ["http error: 500", "http error: 502", "http error: 503", "http error: 504",
-                "timed out", "network connection was lost"].contains(where: message.contains)
+                "timed out", "network connection was lost", "socket is not connected",
+                "connection failed", "disconnected"].contains(where: message.contains)
     }
 
     private func run(_ call: ClientToolCallEvent) async {

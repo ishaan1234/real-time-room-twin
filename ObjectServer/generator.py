@@ -68,9 +68,12 @@ def run(job_dir, inference, status):
     a, b, c = (vertices[faces[:, i]] for i in range(3))
     if np.einsum("ij,ij->i", a, np.cross(b, c)).sum() < 0:
         faces = faces[:, ::-1]
-    # Stand the object on the origin: centred in x and z, lowest point at y = 0.
     low, high = vertices.min(0), vertices.max(0)
-    vertices = vertices - np.array([(low[0] + high[0]) / 2, low[1], (low[2] + high[2]) / 2])
+    if not request.get("preserveWorld", False):
+        # Photo mode wants a reusable model standing at the origin. SAM
+        # Furniture instead keeps the ARKit world pose so it replaces the
+        # scanned object before the room preview is revealed.
+        vertices = vertices - np.array([(low[0] + high[0]) / 2, low[1], (low[2] + high[2]) / 2])
     scan_io.write_ply(os.path.join(job_dir, "model.ply"), vertices, colors, faces,
                       comment="RoomTwin object, metres, +y up")
     return dict(faces=int(len(faces)), size=np.round(high - low, 3).tolist())

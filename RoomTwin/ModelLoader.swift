@@ -8,7 +8,8 @@ enum ModelLoader {
     /// height lies along z rather than y, the model is stood up. Blender's
     /// front (-y) then faces +z. `fitHeight` scales a model of unknown units
     /// (Sketchfab's) to that many metres tall.
-    static func load(_ url: URL, height: Float? = nil, fitHeight: Float? = nil) throws -> SCNNode {
+    static func load(_ url: URL, height: Float? = nil, fitHeight: Float? = nil,
+                     preferWideFront: Bool = false) throws -> SCNNode {
         let scene = try SCNScene(url: url, options: nil)
         let content = SCNNode()
         for child in scene.rootNode.childNodes {
@@ -18,6 +19,17 @@ enum ModelLoader {
         let (lo, hi) = content.boundingBox
         if let height, abs(Float(hi.z - lo.z) - height) < abs(Float(hi.y - lo.y) - height) {
             content.simdOrientation = simd_quatf(angle: -.pi / 2, axis: SIMD3(1, 0, 0))
+        }
+        if preferWideFront {
+            let size = SIMD3(Float(hi.x - lo.x), Float(hi.y - lo.y), Float(hi.z - lo.z))
+            let oriented = content.simdOrientation.act(size)
+            // Catalogue televisions and monitors sometimes arrive with their
+            // broad screen running along z. Turn that broad face onto x so
+            // the holder's +z heading consistently means "screen faces out".
+            if abs(oriented.z) > abs(oriented.x) {
+                content.simdOrientation = simd_quatf(angle: .pi / 2, axis: SIMD3(0, 1, 0))
+                    * content.simdOrientation
+            }
         }
         let assetFolder = url.deletingLastPathComponent()
         content.enumerateHierarchy { node, _ in

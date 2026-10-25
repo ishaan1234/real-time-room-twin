@@ -87,6 +87,107 @@ def latest_mesh(scan_dir):
     return meshes[-1]
 
 
+ROOMPLAN_PROMPTS = {
+    "storage": "cabinet", "refrigerator": "refrigerator", "stove": "stove",
+    "oven": "oven", "dishwasher": "dishwasher", "washerDryer": "washer dryer",
+    "television": "television", "bathtub": "bathtub", "toilet": "toilet",
+    "sink": "sink", "fireplace": "fireplace", "stairs": "stairs",
+}
+
+
+def sam_replacement_manifest(scan_dir):
+    """The newest marker written by the app's SAM Furniture mode, or None."""
+    paths = sorted(glob.glob(os.path.join(scan_dir, "RoomTwin-*.sam.json")))
+    if not paths:
+        return None
+    with open(paths[-1]) as f:
+        value = json.load(f)
+    value["path"] = paths[-1]
+    return value
+
+
+def load_roomplan(scan_dir):
+    """Loads the RoomPlan sidecar selected by the SAM manifest."""
+    manifest = sam_replacement_manifest(scan_dir)
+    if manifest and manifest.get("roomPlanFile"):
+        path = os.path.join(scan_dir, manifest["roomPlanFile"])
+    else:
+        paths = sorted(glob.glob(os.path.join(scan_dir, "RoomTwin-*.roomplan.json")))
+        path = paths[-1] if paths else None
+    if not path or not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def _roomplan_category(value):
+    category = value.get("category", {})
+    return next(iter(category), "object") if isinstance(category, dict) else str(category)
+
+
+def _roomplan_transform(value):
+    return np.asarray(value["transform"], np.float64).reshape(4, 4, order="F")
+
+
+def box_corners(target):
+    """The eight world-space corners of a RoomPlan target."""
+    signs = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)], np.float64)
+    local = signs * target["dimensions"] / 2
+    return local @ target["transform"][:3, :3].T + target["transform"][:3, 3]
+
+
+def points_in_target(points, target, margin=0.0):
+    local = points @ target["inverse"][:3, :3].T + target["inverse"][:3, 3]
+    return (np.abs(local) <= target["dimensions"] / 2 + margin).all(axis=1)
+
+
+def roomplan_targets(scan_dir):
+    """Furniture targets from RoomPlan, in stable sidecar order.
+
+    This intentionally returns nothing for ordinary scans. The SAM Furniture
+    marker is the user's consent to replace detected objects automatically.
+    """
+    if sam_replacement_manifest(scan_dir) is None:
+        return []
+    room = load_roomplan(scan_dir)
+    if not room:
+        return []
+    targets = []
+    for target_id, value in enumerate(room.get("objects", [])):
+        category = _roomplan_category(value)
+        transform = _roomplan_transform(value)
+        targets.append(dict(
+            id=target_id, identifier=value.get("identifier", str(target_id)), category=category,
+            prompt=ROOMPLAN_PROMPTS.get(category, category),
+            confidence=next(iter(value.get("confidence", {})), "unknown"),
+            dimensions=np.asarray(value["dimensions"], np.float64), transform=transform,
+            inverse=np.linalg.inv(transform)))
+    return targets
+
+
+def roomplan_surfaces(scan_dir):
+    """RoomPlan wall/floor planes used only to fill a replaced object's hole."""
+    room = load_roomplan(scan_dir)
+    if not room:
+        return []
+    surfaces = []
+    for kind in ("walls", "floors"):
+        for value in room.get(kind, []):
+            transform = _roomplan_transform(value)
+            surfaces.append(dict(kind=kind[:-1], dimensions=np.asarray(value["dimensions"], np.float64),
+                                 transform=transform, inverse=np.linalg.inv(transform)))
+    return surfaces
+
+
+def projected_target_box(kf, target):
+    """Unclipped upright-image xyxy rectangle for a RoomPlan OBB."""
+    u, v, z = kf.project(box_corners(target))
+    in_front = z > 0.1
+    if np.count_nonzero(in_front) < 4:
+        return None
+    return np.array([u[in_front].min(), v[in_front].min(), u[in_front].max(), v[in_front].max()], np.float32)
+
+
 def rotate_intrinsics(K, width):
     """Intrinsics (fx, fy, cx, cy) after one np.rot90 of an image `width` pixels wide."""
     fx, fy, cx, cy = K
@@ -215,7 +316,9 @@ def load_segments(scan_dir, index):
     data = np.load(path, allow_pickle=True)
     height, width = data["shape"]
     masks = np.unpackbits(data["masks"], axis=-1, count=int(width)).astype(bool)
-    return dict(masks=masks, labels=list(data["labels"]), scores=data["scores"], boxes=data["boxes"])
+    target_ids = data["target_ids"].astype(np.int32) if "target_ids" in data else np.full(len(masks), -1, np.int32)
+    return dict(masks=masks, labels=list(data["labels"]), scores=data["scores"], boxes=data["boxes"],
+                target_ids=target_ids)
 
 
 def p3d_to_cam(points):

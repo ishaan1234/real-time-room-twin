@@ -56,6 +56,10 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
     private let orbitCamera = SCNNode()
     /// Follows the live ARKit camera while AR Edit is active.
     private let arCamera = SCNNode()
+    /// Follows the phone while hand tracking is active in Walk. Unlike AR
+    /// Edit, the reconstructed room remains visible and joystick translation
+    /// is layered over the phone's physical motion.
+    private let handCamera = SCNNode()
     private let orbitTarget: SIMD3<Float>
     /// Carries the walking camera's position and heading; `head` adds the pitch.
     private let walker = SCNNode()
@@ -83,6 +87,7 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
         let scan: MeshSnapshot
         let replacedScanFaces: Set<Int>
         let nodes: [SCNNode]
+        let metadata: RoomEditMetadata
     }
     /// One per wall: its node and its two looks, scanned colours or a texture.
     private var wallNodes: [SurfaceNode] = []
@@ -105,6 +110,10 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
     private var mode: Mode?
     private weak var view: SCNView?
     private var lastUpdate: TimeInterval?
+    private var followsHandCamera = false
+    private var handSessionOrigin: simd_float4x4?
+    private var handRoomOrigin: simd_float4x4?
+    private var handWalkOffset = SIMD3<Float>.zero
     private struct HandGrab {
         let holder: SCNNode
         let initialPose: Pose
@@ -136,17 +145,30 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
     }
     /// The looks set for the whole room, so a preview of the same scan made
     /// longer can take them over (see `continueEdits`).
+    private struct SurfaceLook {
+        let image: Any
+        let size: SIMD2<Float>
+        let reference: RoomEditMetadata.MaterialReference?
+    }
     private struct Look {
-        var walls: (image: Any, size: SIMD2<Float>)?
-        var ground: (image: Any, size: SIMD2<Float>)?
+        var walls: [Int: SurfaceLook] = [:]
+        var ground: SurfaceLook?
+        var objects: [String: SurfaceLook] = [:]
         /// Brightness and warmth.
         var lighting: SIMD2<Float>?
         var ceiling: Bool?
         var openWalls: Bool?
     }
     private var look = Look()
+    private var editIDs: [ObjectIdentifier: String] = [:]
+    /// Editing is Blender-style free movement by default. When enabled, all
+    /// input providers use the same release-time floor, surface and wall snap.
+    var snappingEnabled = false
     private var handGrab: HandGrab?
     private let gizmo = SCNNode()
+    /// Horizontal editing basis inferred from the room's dominant wall pair.
+    /// Move/rotate handles use this instead of arbitrary AR world axes.
+    private let roomAxesOrientation: simd_quatf
     private var gizmoDrag: GizmoDrag?
     private var undoEdits: [TransformEdit] = []
     private var redoEdits: [TransformEdit] = []
@@ -165,6 +187,12 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
         let objectFaces = Set(mesh.editableObjects.flatMap { $0.faces })
         floorPlan = FloorPlan(mesh, floorY: floorY, excludingFaces: objectFaces)
         walls = WallFinder.walls(in: mesh, floorY: floorY, excludingFaces: objectFaces)
+        if let wall = walls.first {
+            roomAxesOrientation = simd_quatf(angle: atan2(wall.normal.x, wall.normal.z),
+                                             axis: SIMD3(0, 1, 0))
+        } else {
+            roomAxesOrientation = simd_quatf(angle: 0, axis: SIMD3(0, 1, 0))
+        }
         super.init()
         scene.background.contents = PlatformColor(white: 0.08, alpha: 1)
         scene.rootNode.addChildNode(room)
@@ -201,6 +229,8 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
         scene.rootNode.addChildNode(orbitCamera)
         arCamera.camera = Self.camera(fieldOfView: 60, zNear: 0.02)
         scene.rootNode.addChildNode(arCamera)
+        handCamera.camera = Self.camera(fieldOfView: 75, zNear: 0.02)
+        scene.rootNode.addChildNode(handCamera)
         scene.rootNode.addChildNode(gizmo)
         buildGizmo()
     }
@@ -227,7 +257,7 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
             view.defaultCameraController.target = SCNVector3(orbitTarget.x, orbitTarget.y, orbitTarget.z)
         case .walk:
             view.allowsCameraControl = false
-            view.pointOfView = head
+            view.pointOfView = followsHandCamera ? handCamera : head
         case .ar:
             view.allowsCameraControl = false
             view.pointOfView = arCamera
@@ -242,6 +272,57 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
         let projection = frame.camera.projectionMatrix(for: .portrait, viewportSize: view.bounds.size,
                                                        zNear: 0.02, zFar: 30)
         arCamera.camera?.projectionTransform = SCNMatrix4(projection)
+    }
+
+    /// Starts live phone-pose navigation without changing out of Walk mode.
+    /// The first AR frame becomes the origin, so enabling the feature never
+    /// makes the user jump to ARKit's unrelated session origin.
+    func beginHandCameraFollow() {
+        guard mode == .walk else { return }
+        followsHandCamera = true
+        handSessionOrigin = nil
+        handRoomOrigin = head.presentation.simdWorldTransform
+        handWalkOffset = .zero
+        view?.pointOfView = handCamera
+    }
+
+    /// Maps the hand camera's relative ARKit pose into the room and retains a
+    /// separate world-space offset for the joystick.
+    func updateHandCamera(_ frame: ARFrame) {
+        guard mode == .walk, followsHandCamera, let view,
+              view.bounds.width > 0, view.bounds.height > 0 else { return }
+        if handSessionOrigin == nil {
+            handSessionOrigin = frame.camera.transform
+            handRoomOrigin = head.presentation.simdWorldTransform
+        }
+        guard let sessionOrigin = handSessionOrigin, let roomOrigin = handRoomOrigin else { return }
+        var mapped = roomOrigin * simd_inverse(sessionOrigin) * frame.camera.transform
+        mapped.columns.3.x += handWalkOffset.x
+        mapped.columns.3.y += handWalkOffset.y
+        mapped.columns.3.z += handWalkOffset.z
+        handCamera.simdTransform = mapped
+        let projection = frame.camera.projectionMatrix(for: .portrait, viewportSize: view.bounds.size,
+                                                       zNear: 0.02, zFar: 30)
+        handCamera.camera?.projectionTransform = SCNMatrix4(projection)
+    }
+
+    /// Returns from live phone following to the ordinary Walk camera without
+    /// losing either the physical movement or the joystick movement.
+    func endHandCameraFollow() {
+        guard followsHandCamera else { return }
+        let transform = handCamera.presentation.simdWorldTransform
+        let forward = -simd_normalize(SIMD3(transform.columns.2.x,
+                                            transform.columns.2.y,
+                                            transform.columns.2.z))
+        walker.simdPosition = SIMD3(transform.columns.3.x, transform.columns.3.y, transform.columns.3.z)
+        yaw = atan2(-forward.x, -forward.z)
+        pitch = min(max(asin(min(max(forward.y, -1), 1)), -1.2), 1.2)
+        applyLook()
+        followsHandCamera = false
+        handSessionOrigin = nil
+        handRoomOrigin = nil
+        handWalkOffset = .zero
+        if mode == .walk { view?.pointOfView = head }
     }
 
     /// Converts Vision's portrait, lower-left normalized coordinates into the
@@ -274,13 +355,35 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
         defer { lastUpdate = time }
         // The gizmo stays the same size on screen however far away it is.
         if !gizmo.isHidden, let eye = renderer.pointOfView?.simdWorldPosition {
-            gizmo.simdScale = SIMD3(repeating: max(simd_distance(eye, gizmo.simdWorldPosition) * 0.2, 0.05))
+            // Walk is operated with a thumb on a phone, so its handles need a
+            // larger, steadier screen footprint than the orbit mouse/touch
+            // gizmo. The invisible hit cylinders grow with the visible axes.
+            let screenScale: Float = mode == .walk ? 0.30 : 0.22
+            gizmo.simdScale = SIMD3(repeating: max(simd_distance(eye, gizmo.simdWorldPosition) * screenScale, 0.07))
         }
         guard let last = lastUpdate, mode == .walk, move != .zero else { return }
-        // Walking stays level whatever the pitch.
-        let forward = SIMD3(-sin(yaw), 0, -cos(yaw)), right = SIMD3(cos(yaw), 0, -sin(yaw))
+        // Walking stays level whatever the phone's pitch or the touch-look pitch.
+        let forward: SIMD3<Float>, right: SIMD3<Float>
+        if followsHandCamera {
+            let transform = handCamera.presentation.simdWorldTransform
+            let cameraForward = -SIMD3(transform.columns.2.x, 0, transform.columns.2.z)
+            let cameraRight = SIMD3(transform.columns.0.x, 0, transform.columns.0.z)
+            forward = simd_length_squared(cameraForward) > 1e-6
+                ? simd_normalize(cameraForward) : SIMD3(0, 0, -1)
+            right = simd_length_squared(cameraRight) > 1e-6
+                ? simd_normalize(cameraRight) : SIMD3(1, 0, 0)
+        } else {
+            forward = SIMD3(-sin(yaw), 0, -cos(yaw))
+            right = SIMD3(cos(yaw), 0, -sin(yaw))
+        }
         let step = walkSpeed * Float(min(max(time - last, 0), 0.1))
-        walker.simdPosition += (forward * move.y + right * move.x) * step
+        let translation = (forward * move.y + right * move.x) * step
+        if followsHandCamera {
+            handWalkOffset += translation
+            handCamera.simdPosition += translation
+        } else {
+            walker.simdPosition += translation
+        }
     }
 
     // MARK: Furniture
@@ -414,6 +517,7 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
     private func insert(_ model: SCNNode, at spot: SIMD3<Float>, yaw: Float, placement: Placement) {
         let holder = SCNNode()
         holder.name = model.name
+        setEditID("added:\(UUID().uuidString.lowercased())", on: holder)
         holder.simdOrientation = simd_quatf(angle: yaw, axis: SIMD3(0, 1, 0))
         holder.simdPosition = spot
         holder.addChildNode(model)
@@ -430,6 +534,9 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
     /// latest of all. Returns its name, or nil if there's no such piece.
     func removeFurniture(named name: String? = nil) -> String? {
         guard let model = try? piece(named: name) else { return nil }
+        let id = editID(of: model)
+        editIDs.removeValue(forKey: ObjectIdentifier(model))
+        look.objects.removeValue(forKey: id)
         model.childNode(withName: Self.selectionName, recursively: false)?.removeFromParentNode()
         // Out of the list straight away, so it's neither removed twice nor placed against while it fades.
         model.removeFromParentNode()
@@ -443,6 +550,35 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
     /// All editable scanned and added objects, oldest first.
     var furnitureNames: [String] {
         furniture.childNodes.compactMap(\.name)
+    }
+
+    /// Describes only editable objects that are actually visible through the
+    /// current SceneKit camera. This deliberately does not use
+    /// `furnitureNames`: the voice question "what is in front of me?" must not
+    /// turn into an inventory of objects elsewhere in the room.
+    func describeCurrentView() -> String {
+        guard let view, let camera = view.pointOfView, !view.bounds.isEmpty else {
+            return "The current viewport is unavailable."
+        }
+        let middle = CGPoint(x: view.bounds.midX, y: view.bounds.midY)
+        let centre = frontmostFurniture(at: middle)
+        let visible = furniture.childNodes.filter { holder in
+            view.isNode(holder, insideFrustumOf: camera) && hasVisibleSample(of: holder, in: view)
+        }
+        let names = visible.compactMap(\.name).reduce(into: [String]()) { result, name in
+            if !result.contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame }) {
+                result.append(name)
+            }
+        }
+        if let centreName = centre?.name {
+            let others = names.filter { $0.caseInsensitiveCompare(centreName) != .orderedSame }
+            return others.isEmpty
+                ? "Viewport only: \(centreName) is directly in front of the user."
+                : "Viewport only: \(centreName) is directly in front of the user. Also visible: \(others.joined(separator: ", "))."
+        }
+        return names.isEmpty
+            ? "Viewport only: no editable objects are visible."
+            : "Viewport only: visible editable objects are \(names.joined(separator: ", ")). Nothing is directly under the screen centre."
     }
 
     /// Selects the editable object under a screen point. RoomPlan objects and
@@ -479,6 +615,12 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
     /// Shows the gizmo on the selected piece.
     var showsGizmo = false {
         didSet { updateGizmo() }
+    }
+
+    /// Locks the scale handles together: any of them scales the piece evenly,
+    /// as the middle cube does, and they all show white like it.
+    var scalesUniformly = false {
+        didSet { if scalesUniformly != oldValue, gizmoMode == .scale { buildGizmo() } }
     }
 
     var gizmoMode = GizmoMode.move {
@@ -565,7 +707,7 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
             }
             factor = min(max(factor, 0.05), 20)
             var scale = model.simdScale
-            if drag.handle == 3 { scale *= factor } else { scale[drag.handle] *= factor }
+            if drag.handle == 3 || scalesUniformly { scale *= factor } else { scale[drag.handle] *= factor }
             model.simdScale = scale
         }
         select(drag.holder)
@@ -574,6 +716,7 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
     func endGizmoDrag() {
         guard let drag = gizmoDrag else { return }
         gizmoDrag = nil
+        if gizmoMode == .move { snapIfNeeded(drag.holder) }
         if Pose(drag.holder) != drag.before { remember(drag.holder, from: drag.before) }
         select(drag.holder)
     }
@@ -588,7 +731,8 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
     /// so a finger finds it.
     private func buildGizmo() {
         for child in gizmo.childNodes { child.removeFromParentNode() }
-        let colours: [PlatformColor] = [.systemRed, .systemGreen, .systemBlue]
+        let colours: [PlatformColor] = gizmoMode == .scale && scalesUniformly ? [.white, .white, .white]
+            : [.systemRed, .systemGreen, .systemBlue]
         let turns = [simd_quatf(angle: -.pi / 2, axis: SIMD3(0, 0, 1)), simd_quatf(angle: 0, axis: SIMD3(0, 1, 0)),
                      simd_quatf(angle: .pi / 2, axis: SIMD3(1, 0, 0))]
         func part(_ geometry: SCNGeometry, _ colour: PlatformColor?, at height: Float = 0) -> SCNNode {
@@ -636,8 +780,7 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
         let bounds = Self.bounds(selected)
         gizmo.isHidden = false
         gizmo.simdPosition = selected.simdConvertPosition((bounds.lo + bounds.hi) / 2, to: nil)
-        gizmo.simdOrientation = gizmoMode == .scale ? selected.simdWorldOrientation
-            : simd_quatf(angle: 0, axis: SIMD3(0, 1, 0))
+        gizmo.simdOrientation = gizmoMode == .scale ? selected.simdWorldOrientation : roomAxesOrientation
     }
 
     /// A colour drawn over everything, flat; nil for an invisible grab area.
@@ -738,6 +881,7 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
     func endHandGrab() -> String? {
         guard let grab = handGrab else { return nil }
         handGrab = nil
+        snapIfNeeded(grab.holder)
         let moved = simd_distance(grab.initialPosition, grab.holder.simdPosition) > 0.003
         if moved { remember(grab.holder, from: grab.initialPose) }
         select(grab.holder)
@@ -796,9 +940,106 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
         }.min { $0.1 < $1.1 }?.0
     }
 
+    /// The furniture hit before any wall, floor, or other piece. Unlike the
+    /// forgiving editor hit test above, this never sees through occluders.
+    private func frontmostFurniture(at point: CGPoint) -> SCNNode? {
+        guard let view, view.bounds.contains(point),
+              let hit = view.hitTest(point, options: [
+                SCNHitTestOption.categoryBitMask: Self.solid,
+                SCNHitTestOption.searchMode: SCNHitTestSearchMode.closest.rawValue,
+              ]).first else { return nil }
+        var node = hit.node
+        while let parent = node.parent, parent !== furniture { node = parent }
+        return node.parent === furniture ? node : nil
+    }
+
+    /// A frustum test alone includes furniture hidden behind a wall. Sampling
+    /// the projected bounds and requiring that the piece be the first solid
+    /// hit keeps the spoken viewport description faithful to what is drawn.
+    private func hasVisibleSample(of holder: SCNNode, in view: SCNView) -> Bool {
+        let bounds = Self.bounds(holder)
+        let centre = (bounds.lo + bounds.hi) / 2
+        var samples = [centre]
+        for corner in 0..<8 {
+            samples.append(SIMD3(corner & 1 == 0 ? bounds.lo.x : bounds.hi.x,
+                                 corner & 2 == 0 ? bounds.lo.y : bounds.hi.y,
+                                 corner & 4 == 0 ? bounds.lo.z : bounds.hi.z))
+        }
+        return samples.contains { local in
+            let world = holder.simdConvertPosition(local, to: nil)
+            let projected = view.projectPoint(SCNVector3(world))
+            guard projected.z >= 0, projected.z <= 1 else { return false }
+            return frontmostFurniture(at: CGPoint(x: CGFloat(projected.x), y: CGFloat(projected.y))) === holder
+        }
+    }
+
     private func setHandPosition(_ position: SIMD3<Float>, for holder: SCNNode) -> Bool {
         holder.simdPosition = position
         return true
+    }
+
+    /// One shared release policy for voice, hand tracking and the gizmo.
+    /// Motion remains completely free while dragging. With snapping enabled,
+    /// a small prop dropped over a supported box jumps onto its top; otherwise
+    /// nearby floor and wall planes attract the object. Rotation itself is
+    /// intentionally never quantized.
+    @discardableResult
+    private func snapIfNeeded(_ holder: SCNNode) -> String? {
+        guard snappingEnabled else { return nil }
+        let bounds = Self.bounds(holder)
+        let size = bounds.hi - bounds.lo
+        var results: [String] = []
+
+        let surfaceKinds = ["bench", "cabinet", "counter", "desk", "dresser", "island", "nightstand",
+                            "oven", "shelf", "stove", "table", "washer", "dryer"]
+        let area = max(size.x * size.z, 0.001)
+        let surface = furniture.childNodes.compactMap { target -> (SCNNode, Float)? in
+            guard target !== holder else { return nil }
+            let words = (target.name ?? "").lowercased()
+            guard surfaceKinds.contains(where: words.contains) else { return nil }
+            let targetBounds = Self.bounds(target)
+            let targetSize = targetBounds.hi - targetBounds.lo
+            guard size.y <= 0.7, area <= max(targetSize.x * targetSize.z * 0.45, 0.01) else { return nil }
+            let local = target.simdConvertPosition(holder.simdWorldPosition, from: nil)
+            let margin = min(max(min(targetSize.x, targetSize.z) * 0.08, 0.03), 0.12)
+            guard local.x >= targetBounds.lo.x - margin, local.x <= targetBounds.hi.x + margin,
+                  local.z >= targetBounds.lo.z - margin, local.z <= targetBounds.hi.z + margin else { return nil }
+            let top = target.simdConvertPosition(SIMD3(0, targetBounds.hi.y, 0), to: nil).y
+            guard top > floorY + 0.12 else { return nil }
+            return (target, top)
+        }.max { $0.1 < $1.1 }
+
+        if let (target, top) = surface {
+            holder.simdPosition.y += top - (holder.simdWorldPosition.y + bounds.lo.y)
+            results.append("on top of \(target.name ?? "the surface")")
+        } else {
+            let bottom = holder.simdWorldPosition.y + bounds.lo.y
+            if bottom <= floorY + 0.25 {
+                holder.simdPosition.y += floorY - bottom
+                results.append("to the floor")
+            }
+
+            if let wall = nearestWall(to: holder.simdPosition) {
+                let front = holder.simdOrientation.act(SIMD3(0, 0, 1))
+                let right = holder.simdOrientation.act(SIMD3(1, 0, 0))
+                let half = SIMD2(size.x, size.z) / 2
+                let extent = abs(simd_dot(right, wall.normal)) * half.x
+                    + abs(simd_dot(front, wall.normal)) * half.y
+                let distance = wall.distance(to: holder.simdPosition)
+                if abs(distance - extent) <= 0.25 {
+                    let low = wall.span.lowerBound + half.x
+                    let high = wall.span.upperBound - half.x
+                    guard low <= high else { return results.isEmpty ? nil : results.joined(separator: " and ") }
+                    let along = min(max(simd_dot(holder.simdPosition, wall.along), low), high)
+                    holder.simdOrientation = simd_quatf(angle: atan2(wall.normal.x, wall.normal.z),
+                                                        axis: SIMD3(0, 1, 0))
+                    holder.simdPosition = wall.point(along: along, standoff: half.y + 0.025,
+                                                     floorY: holder.simdPosition.y)
+                    results.append("to the wall")
+                }
+            }
+        }
+        return results.isEmpty ? nil : results.joined(separator: " and ")
     }
 
     /// Moves an editable object relative to the current camera. Horizontal
@@ -806,6 +1047,7 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
     @discardableResult
     func moveFurniture(named name: String? = nil, direction: String, distance: Float) throws -> String {
         let holder = try piece(named: name)
+        let before = Pose(holder)
         let amount = min(max(distance, 0.05), 3)
         let camera = view?.pointOfView ?? head
         var forward = camera.simdWorldFront
@@ -821,6 +1063,8 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
         default: amount * forward
         }
         holder.simdPosition += delta
+        snapIfNeeded(holder)
+        if Pose(holder) != before { remember(holder, from: before) }
         select(holder)
         return holder.name ?? "object"
     }
@@ -835,30 +1079,70 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
         return holder.name ?? "object"
     }
 
-    /// Replaces a scanned or added object while preserving its location and
-    /// heading. User edits are intentionally free-form, so the replacement
-    /// may overlap scanned geometry or other objects.
+    /// Replaces a scanned or added object. Location and the complete previous
+    /// orientation are preserved unless the user explicitly asks to put it
+    /// against a wall or face it another way. User edits are intentionally
+    /// free-form, so the replacement may overlap other geometry.
     @discardableResult
-    func replaceFurniture(named name: String?, with model: SCNNode) throws -> String {
+    func replaceFurniture(named name: String?, with model: SCNNode, facing: Facing? = nil,
+                          againstWall: Bool = false) throws -> String {
         let old = try piece(named: name)
+        let previousPosition = old.simdPosition
+        let previousOrientation = old.simdOrientation
+        let previousID = editID(of: old)
         old.childNode(withName: Self.selectionName, recursively: false)?.removeFromParentNode()
         let holder = SCNNode()
         holder.name = model.name ?? old.name
-        holder.simdPosition = old.simdPosition
-        holder.simdOrientation = old.simdOrientation
+        setEditID(previousID, on: holder)
+        look.objects.removeValue(forKey: previousID)
         holder.addChildNode(model)
+
+        var position = previousPosition
+        var orientation = previousOrientation
+        let camera = view?.pointOfView ?? head
+        var placement = "in the previous position and direction"
+        if againstWall, let wall = nearestWall(to: previousPosition) {
+            let bounds = Self.bounds(holder)
+            let halfWidth = (bounds.hi.x - bounds.lo.x) / 2
+            let halfDepth = (bounds.hi.z - bounds.lo.z) / 2
+            let low = wall.span.lowerBound + halfWidth
+            let high = wall.span.upperBound - halfWidth
+            let along = low <= high
+                ? min(max(simd_dot(previousPosition, wall.along), low), high)
+                : simd_dot(previousPosition, wall.along)
+            position = wall.point(along: along, standoff: halfDepth + 0.025, floorY: floorY)
+            // Replacements of mounted objects, such as televisions, retain
+            // their original elevation instead of falling to the floor.
+            position.y = previousPosition.y
+            let direction = facing ?? .awayFromWall
+            orientation = simd_quatf(angle: turn(direction, at: position,
+                                                  eye: camera.simdWorldPosition,
+                                                  wall: wall, reference: old),
+                                         axis: SIMD3(0, 1, 0))
+            placement = "against the nearest wall, " + describe(direction)
+        } else if let facing {
+            orientation = simd_quatf(angle: turn(facing, at: position,
+                                                  eye: camera.simdWorldPosition,
+                                                  wall: nearestWall(to: position), reference: old),
+                                         axis: SIMD3(0, 1, 0))
+            placement = describe(facing)
+        }
+        holder.simdPosition = position
+        holder.simdOrientation = orientation
         addFixtureLightIfNeeded(to: holder, model: model, placement: .inView)
         furniture.addChildNode(holder)
         old.removeFromParentNode()
+        editIDs.removeValue(forKey: ObjectIdentifier(old))
         select(holder)
-        return holder.name ?? "object"
+        return "\(holder.name ?? "object") \(placement)"
     }
 
     /// Changes the visible material on the latest matching added object. The
     /// downloaded models already have UV coordinates; cloning every material
     /// prevents one edit from changing another copy of the same cached model.
     @discardableResult
-    func setFurnitureTexture(_ image: Any, named name: String? = nil) throws -> String {
+    func setFurnitureTexture(_ image: Any, named name: String? = nil,
+                             reference: RoomEditMetadata.MaterialReference? = nil) throws -> String {
         let holder = try piece(named: name)
         var changed = 0
         holder.enumerateHierarchy { node, _ in
@@ -870,6 +1154,10 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
                 material.lightingModel = .physicallyBased
                 material.shaderModifiers = [:]
                 material.diffuse.contents = image
+                // Editable scan objects carry their baked capture colours on
+                // UV channel 1; user-selected tiling materials use the planar
+                // metre UVs on channel 0.
+                material.diffuse.mappingChannel = 0
                 material.diffuse.wrapS = .repeat
                 material.diffuse.wrapT = .repeat
                 material.diffuse.mipFilter = .linear
@@ -882,6 +1170,7 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
         guard changed > 0 else {
             throw PlacementError(errorDescription: "The \(holder.name ?? "object") has no editable surface.")
         }
+        look.objects[editID(of: holder)] = SurfaceLook(image: image, size: .one, reference: reference)
         return holder.name ?? "object"
     }
 
@@ -1127,6 +1416,18 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
         return match
     }
 
+    private func editID(of holder: SCNNode) -> String {
+        let key = ObjectIdentifier(holder)
+        if let id = editIDs[key] { return id }
+        let id = "added:\(UUID().uuidString.lowercased())"
+        editIDs[key] = id
+        return id
+    }
+
+    private func setEditID(_ id: String, on holder: SCNNode) {
+        editIDs[ObjectIdentifier(holder)] = id
+    }
+
     /// Whether a footprint is on clear floor and clear of furniture already added.
     private func hasRoom(_ footprint: Footprint) -> Bool {
         guard floorPlan.isClear(footprint) else { return false }
@@ -1230,6 +1531,21 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
         return result
     }
 
+    private static func values(of matrix: simd_float4x4) -> [Float] {
+        [matrix.columns.0.x, matrix.columns.0.y, matrix.columns.0.z, matrix.columns.0.w,
+         matrix.columns.1.x, matrix.columns.1.y, matrix.columns.1.z, matrix.columns.1.w,
+         matrix.columns.2.x, matrix.columns.2.y, matrix.columns.2.z, matrix.columns.2.w,
+         matrix.columns.3.x, matrix.columns.3.y, matrix.columns.3.z, matrix.columns.3.w]
+    }
+
+    private static func matrix(from values: [Float]) -> simd_float4x4? {
+        guard values.count == 16 else { return nil }
+        return simd_float4x4(SIMD4(values[0], values[1], values[2], values[3]),
+                             SIMD4(values[4], values[5], values[6], values[7]),
+                             SIMD4(values[8], values[9], values[10], values[11]),
+                             SIMD4(values[12], values[13], values[14], values[15]))
+    }
+
     private func canSee(_ point: SIMD3<Float>, from eye: SIMD3<Float>) -> Bool {
         scene.rootNode.hitTestWithSegment(from: SCNVector3(eye), to: SCNVector3(point),
                                           options: [SCNHitTestOption.categoryBitMask.rawValue: Self.solid,
@@ -1244,7 +1560,8 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
     /// limits it to the wall the middle of the view points at. Returns how
     /// many walls changed.
     @discardableResult
-    func setWallTexture(_ image: Any?, size: SIMD2<Float> = .one, wallsInView: Bool = false) throws -> Int {
+    func setWallTexture(_ image: Any?, size: SIMD2<Float> = .one, wallsInView: Bool = false,
+                        reference: RoomEditMetadata.MaterialReference? = nil) throws -> Int {
         var chosen = Array(wallNodes.indices)
         if wallsInView {
             let camera = view?.pointOfView ?? head
@@ -1256,32 +1573,40 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
             chosen = [index]
         }
         guard !chosen.isEmpty else { throw PlacementError(errorDescription: "No wall was found in the scan.") }
-        if !wallsInView { look.walls = image.map { ($0, size) } }
         for i in chosen {
             let wall = wallNodes[i]
             guard let image else {
                 wall.node.geometry = wall.colored
                 wallNodes[i].isTextured = false
+                look.walls.removeValue(forKey: i)
                 continue
             }
-            let material = Self.surfaceMaterial(image)
-            // The wall's texture coordinates are in metres.
-            material.diffuse.contentsTransform = SCNMatrix4(simd_float4x4(diagonal: SIMD4(1 / size.x, 1 / size.y, 1, 1)))
-            wall.bare.materials = [material]
-            wall.node.geometry = wall.bare
-            wallNodes[i].isTextured = true
+            applyWallLook(SurfaceLook(image: image, size: size, reference: reference), to: i)
         }
         return chosen.count
+    }
+
+    private func applyWallLook(_ appearance: SurfaceLook, to index: Int) {
+        let wall = wallNodes[index]
+        let material = Self.surfaceMaterial(appearance.image)
+        // The wall's texture coordinates are in metres.
+        material.diffuse.contentsTransform = SCNMatrix4(simd_float4x4(
+            diagonal: SIMD4(1 / appearance.size.x, 1 / appearance.size.y, 1, 1)))
+        wall.bare.materials = [material]
+        wall.node.geometry = wall.bare
+        wallNodes[index].isTextured = true
+        look.walls[index] = appearance
     }
 
     /// Covers only the scanned floor, never tabletops or other horizontal
     /// objects, with a real-scale tiling material.
     @discardableResult
-    func setGroundTexture(_ image: Any?, size: SIMD2<Float> = .one) throws -> Int {
+    func setGroundTexture(_ image: Any?, size: SIMD2<Float> = .one,
+                          reference: RoomEditMetadata.MaterialReference? = nil) throws -> Int {
         guard var ground = groundNode else {
             throw PlacementError(errorDescription: "No floor surface was found in the scan.")
         }
-        look.ground = image.map { ($0, size) }
+        look.ground = image.map { SurfaceLook(image: $0, size: size, reference: reference) }
         guard let image else {
             ground.node.geometry = ground.colored
             ground.isTextured = false
@@ -1399,15 +1724,27 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
         // object nodes below—even if the user removed one.
         var replaced = Set(sourceMesh.editableObjects.flatMap { $0.faces })
         var nodes: [SCNNode] = []
-        for wall in wallNodes where wall.isTextured {
+        var savedWalls: [RoomEditMetadata.WallMaterial] = []
+        for (index, wall) in wallNodes.enumerated() where wall.isTextured {
             replaced.formUnion(wall.faces)
-            nodes.append(wall.node.clone())
+            let name = "RoomTwin wall material \(index)"
+            let copy = wall.node.clone()
+            copy.name = name
+            nodes.append(copy)
+            savedWalls.append(.init(wallIndex: index, exportNodeName: name,
+                                    material: look.walls[index]?.reference))
         }
+        var savedFloor: RoomEditMetadata.FloorMaterial?
         if let groundNode, groundNode.isTextured {
             replaced.formUnion(groundNode.faces)
-            nodes.append(groundNode.node.clone())
+            let name = "RoomTwin floor material"
+            let copy = groundNode.node.clone()
+            copy.name = name
+            nodes.append(copy)
+            savedFloor = .init(exportNodeName: name, material: look.ground?.reference)
         }
 
+        var savedFurniture: [RoomEditMetadata.FurnitureItem] = []
         if !furniture.childNodes.isEmpty {
             let copy = furniture.clone()
             copy.name = Self.furnitureName
@@ -1418,14 +1755,42 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
             }
             // A model may still be halfway through its 0.35-second drop. Its
             // authored position is always the holder's origin in the export.
-            for holder in copy.childNodes {
+            for (index, holder) in copy.childNodes.enumerated() {
+                let original = furniture.childNodes[index]
+                let id = editID(of: original)
+                let exportName = "RoomTwin item \(index)"
+                holder.name = exportName
                 holder.childNodes.first?.simdPosition = .zero
+                let scale = original.childNodes.first?.simdScale ?? .one
+                savedFurniture.append(.init(id: id,
+                                            name: original.name ?? "object",
+                                            modelName: original.childNodes.first?.name ?? original.name ?? "object",
+                                            source: id.hasPrefix("scan:") ? "room-scan" : "added-model",
+                                            exportNodeName: exportName,
+                                            transform: Self.values(of: original.simdTransform),
+                                            modelScale: [scale.x, scale.y, scale.z],
+                                            material: look.objects[id]?.reference))
             }
             nodes.append(copy)
         }
-        if !enclosure.childNodes.isEmpty { nodes.append(enclosure.clone()) }
-        nodes.append(lightRig.clone())
-        return ExportContents(scan: sourceMesh, replacedScanFaces: replaced, nodes: nodes)
+        if !enclosure.childNodes.isEmpty {
+            let copy = enclosure.clone()
+            copy.name = "RoomTwin enclosure"
+            nodes.append(copy)
+        }
+        let lights = lightRig.clone()
+        lights.name = "RoomTwin lights"
+        nodes.append(lights)
+        let hasCeiling = enclosure.childNode(withName: "RoomTwin enclosure ceiling", recursively: false) != nil
+        let hasAddedWalls = enclosure.childNodes.contains { $0.name?.hasPrefix("RoomTwin enclosure wall") == true }
+        let metadata = RoomEditMetadata(version: RoomEditMetadata.currentVersion,
+                                        furniture: savedFurniture,
+                                        wallMaterials: savedWalls,
+                                        floorMaterial: savedFloor,
+                                        lighting: look.lighting.map { .init(brightness: $0.x, warmth: $0.y) },
+                                        enclosure: .init(ceiling: hasCeiling, openWalls: hasAddedWalls),
+                                        snappingEnabled: snappingEnabled)
+        return ExportContents(scan: sourceMesh, replacedScanFaces: replaced, nodes: nodes, metadata: metadata)
     }
 
     /// Takes over what was done in a preview of the same scan before it was
@@ -1435,13 +1800,120 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
     func continueEdits(from earlier: PreviewScene) {
         earlier.clearSelection()
         for holder in earlier.furniture.childNodes {
+            let id = earlier.editID(of: holder)
             furniture.addChildNode(holder)
+            setEditID(id, on: holder)
         }
         let look = earlier.look
-        if let walls = look.walls { _ = try? setWallTexture(walls.image, size: walls.size) }
-        if let ground = look.ground { _ = try? setGroundTexture(ground.image, size: ground.size) }
+        for (index, appearance) in look.walls where wallNodes.indices.contains(index) {
+            applyWallLook(appearance, to: index)
+        }
+        if let ground = look.ground {
+            _ = try? setGroundTexture(ground.image, size: ground.size, reference: ground.reference)
+        }
+        self.look.objects = look.objects
         if let lighting = look.lighting { setLighting(brightness: lighting.x, warmth: lighting.y) }
         if look.ceiling != nil || look.openWalls != nil { setEnclosure(ceiling: look.ceiling, openWalls: look.openWalls) }
+        snappingEnabled = earlier.snappingEnabled
+    }
+
+    /// Restores a versioned edit snapshot. Stable IDs, rather than display
+    /// names, match scanned pieces, while the companion USDZ supplies the
+    /// exact model meshes and texture images.
+    func restoreEdits(from saved: SCNScene, metadata: RoomEditMetadata) {
+        guard metadata.version <= RoomEditMetadata.currentVersion else { return }
+        func plain(_ name: String?) -> String? { name?.replacingOccurrences(of: "_", with: " ") }
+        func savedNode(named name: String) -> SCNNode? {
+            var match: SCNNode?
+            saved.rootNode.enumerateChildNodes { node, stop in
+                if plain(node.name) == name {
+                    match = node
+                    stop.pointee = true
+                }
+            }
+            return match
+        }
+        func geometryNode(in node: SCNNode) -> SCNNode? {
+            if node.geometry != nil { return node }
+            var match: SCNNode?
+            node.enumerateChildNodes { child, stop in
+                if child.geometry != nil {
+                    match = child
+                    stop.pointee = true
+                }
+            }
+            return match
+        }
+        var group: SCNNode?
+        saved.rootNode.enumerateChildNodes { node, stop in
+            if plain(node.name) == Self.furnitureName {
+                group = node
+                stop.pointee = true
+            }
+        }
+        let existing = Dictionary(uniqueKeysWithValues: furniture.childNodes.map { (editID(of: $0), $0) })
+        var kept = Set<String>()
+        if let group {
+            for item in metadata.furniture {
+                guard let savedHolder = group.childNodes.first(where: { plain($0.name) == item.exportNodeName }) else { continue }
+                let holder: SCNNode
+                if let current = existing[item.id] {
+                    current.childNodes.forEach { $0.removeFromParentNode() }
+                    savedHolder.childNodes.forEach { current.addChildNode($0.clone()) }
+                    holder = current
+                } else {
+                    holder = savedHolder.clone()
+                    furniture.addChildNode(holder)
+                }
+                holder.name = item.name
+                setEditID(item.id, on: holder)
+                holder.simdTransform = Self.matrix(from: item.transform) ?? savedHolder.simdTransform
+                if item.modelScale.count == 3 {
+                    holder.childNodes.first?.simdScale = SIMD3(item.modelScale[0], item.modelScale[1], item.modelScale[2])
+                }
+                holder.enumerateHierarchy { node, _ in
+                    if node.geometry != nil { node.categoryBitMask = Self.solid }
+                }
+                if let material = item.material {
+                    look.objects[item.id] = SurfaceLook(image: PlatformColor.white, size: .one,
+                                                        reference: material)
+                }
+                kept.insert(item.id)
+            }
+        }
+        for (id, holder) in existing where id.hasPrefix("scan:") && !kept.contains(id) {
+            holder.removeFromParentNode()
+        }
+
+        for wall in metadata.wallMaterials where wallNodes.indices.contains(wall.wallIndex) {
+            guard let source = savedNode(named: wall.exportNodeName).flatMap(geometryNode),
+                  let geometry = source.geometry else { continue }
+            let target = wallNodes[wall.wallIndex]
+            target.bare.materials = geometry.materials.map { ($0.copy() as? SCNMaterial) ?? $0 }
+            target.node.geometry = target.bare
+            wallNodes[wall.wallIndex].isTextured = true
+            let size = wall.material?.size
+            let tile = size?.count == 2 ? SIMD2(size![0], size![1]) : .one
+            let image = target.bare.firstMaterial?.diffuse.contents ?? PlatformColor.white
+            look.walls[wall.wallIndex] = SurfaceLook(image: image, size: tile, reference: wall.material)
+        }
+        if let floor = metadata.floorMaterial,
+           let source = savedNode(named: floor.exportNodeName).flatMap(geometryNode),
+           let geometry = source.geometry, var target = groundNode {
+            target.bare.materials = geometry.materials.map { ($0.copy() as? SCNMaterial) ?? $0 }
+            target.node.geometry = target.bare
+            target.isTextured = true
+            groundNode = target
+            let size = floor.material?.size
+            let tile = size?.count == 2 ? SIMD2(size![0], size![1]) : .one
+            let image = target.bare.firstMaterial?.diffuse.contents ?? PlatformColor.white
+            look.ground = SurfaceLook(image: image, size: tile, reference: floor.material)
+        }
+        if let lighting = metadata.lighting {
+            setLighting(brightness: lighting.brightness, warmth: lighting.warmth)
+        }
+        _ = setEnclosure(ceiling: metadata.enclosure.ceiling, openWalls: metadata.enclosure.openWalls)
+        snappingEnabled = metadata.snappingEnabled
     }
 
     /// Puts back the furniture of a room exported by `exportContents`, for a
@@ -1527,15 +1999,15 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
             room.addChildNode(surface.node)
             groundNode = surface
         }
-        for object in mesh.editableObjects {
-            addEditableObject(object, from: mesh)
+        for (index, object) in mesh.editableObjects.enumerated() {
+            addEditableObject(object, from: mesh, editID: "scan:\(index)")
         }
     }
 
     /// Keeps a RoomPlan object separate from the room shell. Its mesh remains
     /// in `sourceMesh` for raw PLY export, while this local copy can be tapped,
     /// moved, resized, textured, replaced or removed.
-    private func addEditableObject(_ object: MeshSnapshot.EditableObject, from mesh: MeshSnapshot) {
+    private func addEditableObject(_ object: MeshSnapshot.EditableObject, from mesh: MeshSnapshot, editID: String) {
         guard !object.faces.isEmpty else { return }
         var remap: [UInt32: UInt32] = [:]
         var piece = MeshSnapshot()
@@ -1563,6 +2035,7 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
         model.name = object.name
         let holder = SCNNode()
         holder.name = object.name
+        setEditID(editID, on: holder)
         holder.simdPosition = origin
         holder.addChildNode(model)
         furniture.addChildNode(holder)
@@ -1606,18 +2079,27 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
     /// meshes start as vertex-coloured PLY, so they need generated UVs before
     /// a Poly Haven material can be applied interactively.
     private static func editableMeshNode(_ mesh: MeshSnapshot) -> SCNNode {
-        var points: [Float] = [], normals: [Float] = [], colors: [Float] = [], uvs: [Float] = []
+        var points: [Float] = [], normals: [Float] = [], colors: [Float] = []
+        var uvs: [Float] = [], colorUVs: [Float] = []
         points.reserveCapacity(mesh.faces.count * 9)
         normals.reserveCapacity(mesh.faces.count * 9)
         colors.reserveCapacity(mesh.faces.count * 9)
         uvs.reserveCapacity(mesh.faces.count * 6)
-        for face in mesh.faces {
+        colorUVs.reserveCapacity(mesh.faces.count * 6)
+        let cellsWide = max(Int(Double(max(mesh.faces.count, 1)).squareRoot().rounded(.up)), 1)
+        let atlasWidth = cellsWide * 2
+        let atlasRows = max((mesh.faces.count + cellsWide - 1) / cellsWide, 1)
+        let atlasHeight = atlasRows * 2
+        for (faceNumber, face) in mesh.faces.enumerated() {
             let indices = [Int(face.x), Int(face.y), Int(face.z)]
             let p = indices.map { mesh.positions[$0] }
             let normal = simd_normalize(simd_cross(p[1] - p[0], p[2] - p[0]))
             let axis = abs(normal.x) > abs(normal.y) && abs(normal.x) > abs(normal.z) ? 0
                 : abs(normal.y) > abs(normal.z) ? 1 : 2
-            for (index, point) in zip(indices, p) {
+            let cellX = (faceNumber % cellsWide) * 2
+            let cellY = (faceNumber / cellsWide) * 2
+            let atlasCorners = [(cellX, cellY), (cellX + 1, cellY), (cellX, cellY + 1)]
+            for ((index, point), atlas) in zip(zip(indices, p), atlasCorners) {
                 let color = mesh.colors[index]
                 points += [point.x, point.y, point.z]
                 normals += [normal.x, normal.y, normal.z]
@@ -1628,6 +2110,8 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
                 default: SIMD2(point.x, point.y)
                 }
                 uvs += [uv.x, uv.y]
+                colorUVs += [(Float(atlas.0) + 0.5) / Float(atlasWidth),
+                             (Float(atlas.1) + 0.5) / Float(atlasHeight)]
             }
         }
         func source(_ values: [Float], _ semantic: SCNGeometrySource.Semantic, _ components: Int) -> SCNGeometrySource {
@@ -1640,12 +2124,58 @@ final class PreviewScene: NSObject, SCNSceneRendererDelegate {
         let element = SCNGeometryElement(data: indices.withUnsafeBytes { Data($0) }, primitiveType: .triangles,
                                          primitiveCount: mesh.faces.count, bytesPerIndex: 4)
         let geometry = SCNGeometry(sources: [source(points, .vertex, 3), source(normals, .normal, 3),
-                                             source(colors, .color, 3), source(uvs, .texcoord, 2)],
+                                             source(colors, .color, 3), source(uvs, .texcoord, 2),
+                                             source(colorUVs, .texcoord, 2)],
                                    elements: [element])
-        geometry.materials = [scanMaterial()]
+        geometry.materials = [editableColorMaterial(Self.colorAtlas(mesh, width: atlasWidth, height: atlasHeight))]
         let node = SCNNode(geometry: geometry)
         node.categoryBitMask = solid
         return node
+    }
+
+    /// Each triangle gets its own 2x2 colour cell. This is the same strategy
+    /// used by MeshExport, but kept on the editable SceneKit node so the
+    /// colours survive when that node is cloned into a USDZ export.
+    private static func colorAtlas(_ mesh: MeshSnapshot, width: Int, height: Int) -> CGImage? {
+        var pixels = [UInt8](repeating: 255, count: width * height * 4)
+        let cellsWide = max(width / 2, 1)
+        for (faceNumber, face) in mesh.faces.enumerated() {
+            let x = (faceNumber % cellsWide) * 2
+            let y = (faceNumber / cellsWide) * 2
+            let indices = [Int(face.x), Int(face.y), Int(face.z)]
+            let locations = [(x, y), (x + 1, y), (x, y + 1)]
+            for (index, location) in zip(indices, locations) {
+                let color = mesh.colors[index]
+                let offset = (location.1 * width + location.0) * 4
+                pixels[offset] = color.x
+                pixels[offset + 1] = color.y
+                pixels[offset + 2] = color.z
+            }
+            let b = mesh.colors[indices[1]], c = mesh.colors[indices[2]]
+            let offset = ((y + 1) * width + x + 1) * 4
+            pixels[offset] = UInt8((UInt16(b.x) + UInt16(c.x)) / 2)
+            pixels[offset + 1] = UInt8((UInt16(b.y) + UInt16(c.y)) / 2)
+            pixels[offset + 2] = UInt8((UInt16(b.z) + UInt16(c.z)) / 2)
+        }
+        let data = Data(pixels) as CFData
+        guard let provider = CGDataProvider(data: data) else { return nil }
+        return CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: true,
+                       intent: .defaultIntent)
+    }
+
+    private static func editableColorMaterial(_ atlas: CGImage?) -> SCNMaterial {
+        let material = SCNMaterial()
+        material.lightingModel = .physicallyBased
+        material.diffuse.contents = atlas ?? PlatformColor(white: 0.72, alpha: 1)
+        material.diffuse.mappingChannel = 1
+        material.diffuse.mipFilter = .linear
+        material.roughness.contents = 0.85
+        material.metalness.contents = 0.0
+        material.isDoubleSided = true
+        return material
     }
 
     /// Soft light for added furniture; the scan itself is unlit.

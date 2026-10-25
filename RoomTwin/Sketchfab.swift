@@ -100,7 +100,12 @@ enum Sketchfab {
             try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
             try usdz.write(to: file, options: .atomic)
         }
-        let node = try await Task.detached { try ModelLoader.load(file, fitHeight: height) }.value
+        let titleWords = Set(model.name.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init))
+        let screenWords: Set<String> = ["display", "monitor", "screen", "television", "tv"]
+        let node = try await Task.detached {
+            try ModelLoader.load(file, fitHeight: height,
+                                 preferWideFront: !titleWords.isDisjoint(with: screenWords))
+        }.value
         node.name = model.name
         return node
     }

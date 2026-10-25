@@ -13,10 +13,12 @@ Every request must carry the token in an X-Token header.
                                  "image": JPEG, "depth": Float32 plane, "confidence": UInt8 plane}
                                  (the three files base64) -> {"id", "turns", "width", "height"}
                                  `turns` is how many np.rot90 turns make the photo upright.
-  POST /photos/ID/select        {"x", "y"}: the tap, 0...1 across the upright photo
+  POST /photos/ID/select        {"points": [{"x", "y", "label"}]}: positive points
+                                 on one object, 0...1 across the upright photo
                                  -> {"masks": [{"overlay": RGBA PNG base64, "score", "area"}],
                                      "best"}: SAM 3's three candidates, largest first
-  POST /photos/ID/generate      {"mask": index into masks} -> {"job"}
+  POST /photos/ID/segment       {"prompt"}: text-segments only the RoomPlan box stored with the photo
+  POST /photos/ID/generate      {"mask": index into masks, "preserveWorld": bool} -> {"job"}
   GET  /jobs/JOB                {"state": "queued" | "running" | "done" | "failed", "message", ...}
   GET  /jobs/JOB/model.ply      the model: metres, +y up, standing on the origin
 
@@ -63,15 +65,27 @@ class Segmenter:
         self.photo = None
         self.state = None
 
-    def select(self, photo_id, image, x, y):
+    def select(self, photo_id, image, points, labels):
         with self.lock, torch.autocast("cuda", dtype=torch.bfloat16):
             if self.photo != photo_id:
                 self.state = self.processor.set_image(Image.fromarray(image))
                 self.photo = photo_id
             masks, scores, _ = self.model.predict_inst(
-                self.state, point_coords=np.array([[x, y]], dtype=np.float32),
-                point_labels=np.array([1]), multimask_output=True)
+                self.state, point_coords=np.asarray(points, dtype=np.float32),
+                point_labels=np.asarray(labels, dtype=np.int32), multimask_output=True)
         return np.asarray(masks) > 0, np.asarray(scores, dtype=np.float32)
+
+    def text(self, photo_id, image, prompt):
+        with self.lock, torch.autocast("cuda", dtype=torch.bfloat16):
+            if self.photo != photo_id:
+                self.state = self.processor.set_image(Image.fromarray(image))
+                self.photo = photo_id
+            output = self.processor.set_text_prompt(state=self.state, prompt=prompt)
+        masks = np.asarray(output["masks"].float().cpu())
+        if masks.ndim == 4:
+            masks = masks[:, 0]
+        return masks > 0, np.asarray(output["scores"].float().cpu(), np.float32), \
+            np.asarray(output["boxes"].float().cpu(), np.float32)
 
 
 def overlay_png(mask):
@@ -120,18 +134,84 @@ def add_photo(body):
 
 def select(segmenter, photo_id, body):
     kf = load_keyframe(photo_id)
-    x = float(np.clip(body["x"], 0, 1)) * (kf.width - 1)
-    y = float(np.clip(body["y"], 0, 1)) * (kf.height - 1)
+    requested = body.get("points") or [body]
+    if not requested:
+        raise ValueError("at least one selection point is required")
+    points = [[float(np.clip(point["x"], 0, 1)) * (kf.width - 1),
+               float(np.clip(point["y"], 0, 1)) * (kf.height - 1)] for point in requested]
+    labels = [1 if int(point.get("label", 1)) else 0 for point in requested]
     start = time.time()
-    masks, scores = segmenter.select(photo_id, kf.image, x, y)
+    masks, scores = segmenter.select(photo_id, kf.image, points, labels)
     order = np.argsort([-m.sum() for m in masks])   # largest first
     masks, scores = masks[order], scores[order]
     np.savez_compressed(os.path.join(photo_dir(photo_id), "masks.npz"), masks=np.packbits(masks, axis=-1),
                         shape=np.array(masks.shape[1:]))
-    print(f"select {photo_id} ({x:.0f}, {y:.0f}): scores {np.round(scores, 3).tolist()} "
+    coordinates = ", ".join(f"({x:.0f}, {y:.0f})" for x, y in points)
+    print(f"select {photo_id} {coordinates}: scores {np.round(scores, 3).tolist()} "
           f"in {time.time() - start:.2f} s", flush=True)
     return dict(masks=[dict(overlay=overlay_png(m), score=float(s), area=float(m.mean())) for m, s in zip(masks, scores)],
                 best=int(np.argmax(scores)))
+
+
+def mask_box(mask):
+    y, x = np.nonzero(mask)
+    return None if not len(x) else np.array([x.min(), y.min(), x.max() + 1, y.max() + 1], np.float32)
+
+
+def overlap_with_target(detected, target):
+    area = max(1.0, (detected[2] - detected[0]) * (detected[3] - detected[1]))
+    intersection = max(0.0, min(detected[2], target[2]) - max(detected[0], target[0])) \
+        * max(0.0, min(detected[3], target[3]) - max(detected[1], target[1]))
+    centre = (detected[:2] + detected[2:]) / 2
+    pad = 0.15 * max(target[2] - target[0], target[3] - target[1])
+    centre_inside = target[0] - pad <= centre[0] <= target[2] + pad \
+        and target[1] - pad <= centre[1] <= target[3] + pad
+    return intersection / area if centre_inside else 0.0
+
+
+def segment_target(segmenter, photo_id, body):
+    """Text segmentation constrained to the photographed RoomPlan object."""
+    path = photo_dir(photo_id)
+    with open(os.path.join(path, "entry.json")) as f:
+        entry = json.load(f)
+    dimensions = np.asarray(entry["targetDimensions"], np.float64)
+    transform = np.asarray(entry["targetTransform"], np.float64).reshape(4, 4, order="F")
+    target = dict(dimensions=dimensions, transform=transform, inverse=np.linalg.inv(transform))
+    kf = load_keyframe(photo_id)
+    predicted = scan_io.projected_target_box(kf, target)
+    if predicted is None:
+        raise ValueError("the RoomPlan target is behind the camera")
+
+    masks, scores, boxes = segmenter.text(photo_id, kf.image, str(body["prompt"]))
+    candidates = []
+    for mask, score, box in zip(masks, scores, boxes):
+        if box.max(initial=0) <= 2:
+            box = box * np.array([kf.width, kf.height, kf.width, kf.height], np.float32)
+        overlap = overlap_with_target(box, predicted)
+        if overlap >= 0.25:
+            candidates.append((float(score) * overlap, mask, float(score), overlap))
+
+    # Text can miss an unusual-looking instance. The box centre is still a
+    # safe point prompt because the result must pass the same projected-box check.
+    if not candidates:
+        centre = (predicted[:2] + predicted[2:]) / 2
+        point_masks, point_scores = segmenter.select(
+            photo_id, kf.image, [[centre[0], centre[1]]], [1])
+        for mask, score in zip(point_masks, point_scores):
+            box = mask_box(mask)
+            if box is None:
+                continue
+            overlap = overlap_with_target(box, predicted)
+            if overlap >= 0.25:
+                candidates.append((float(score) * overlap, mask, float(score), overlap))
+    if not candidates:
+        raise ValueError("SAM could not isolate the detected furniture inside its RoomPlan box")
+
+    _, mask, score, overlap = max(candidates, key=lambda item: item[0])
+    np.savez_compressed(os.path.join(path, "masks.npz"), masks=np.packbits(mask[None], axis=-1),
+                        shape=np.array(mask.shape))
+    print(f"segment {photo_id} {body['prompt']}: score {score:.3f}, box overlap {overlap:.3f}", flush=True)
+    return dict(mask=0, score=score, overlap=float(overlap), area=float(mask.mean()))
 
 
 def generate(photo_id, body):
@@ -142,7 +222,8 @@ def generate(photo_id, body):
     job_dir = os.path.join(path, f"job-{number}")
     os.makedirs(job_dir)
     with open(os.path.join(job_dir, "request.json.tmp"), "w") as f:
-        json.dump(dict(mask=int(body["mask"]), created=time.time()), f)
+        json.dump(dict(mask=int(body["mask"]), preserveWorld=bool(body.get("preserveWorld", False)),
+                       created=time.time()), f)
     os.replace(os.path.join(job_dir, "request.json.tmp"), os.path.join(job_dir, "request.json"))
     return dict(job=f"{photo_id}-{number}")
 
@@ -199,6 +280,8 @@ def make_handler(segmenter):
                     return self.reply(200, add_photo(body))
                 if method == "POST" and len(path) == 3 and path[0] == "photos" and path[2] == "select":
                     return self.reply(200, select(segmenter, path[1], body))
+                if method == "POST" and len(path) == 3 and path[0] == "photos" and path[2] == "segment":
+                    return self.reply(200, segment_target(segmenter, path[1], body))
                 if method == "POST" and len(path) == 3 and path[0] == "photos" and path[2] == "generate":
                     return self.reply(200, generate(path[1], body))
                 if method == "GET" and len(path) == 2 and path[0] == "jobs":

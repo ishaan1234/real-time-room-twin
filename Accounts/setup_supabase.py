@@ -170,13 +170,14 @@ def main():
 
     room_folder = f"{user}/{uuid.uuid4()}"
     room_files = {"room.usdz": "model/vnd.usdz+zip", "room.ply": "application/octet-stream",
-                  "room.json": "application/json"}
+                  "room.json": "application/json", "room-edits.json": "application/json"}
     for filename, content_type in room_files.items():
         call(url, key, "POST", f"storage/v1/object/room-layouts/{room_folder}/{filename}",
              b"check", token, content_type)
     call(url, key, "POST", "rest/v1/room_layouts",
          {"name": "setup room", "model_path": f"{room_folder}/room.usdz",
-          "ply_path": f"{room_folder}/room.ply", "json_path": f"{room_folder}/room.json"}, token)
+          "ply_path": f"{room_folder}/room.ply", "json_path": f"{room_folder}/room.json",
+          "edits_path": f"{room_folder}/room-edits.json"}, token)
     rooms = call(url, key, "GET", "rest/v1/room_layouts?select=id,model_path", token=token)
     assert len(rooms) == 1, rooms
     call(url, key, "DELETE", f"rest/v1/room_layouts?id=eq.{rooms[0]['id']}", token=token)

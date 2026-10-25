@@ -7,6 +7,11 @@ import SwiftUI
 struct ObjectServerConfig: Codable, Equatable {
     var url: String
     var token: String
+    /// Optional Mac-hosted fal.ai gateway. The key remains in .env.local;
+    /// only this authenticated local URL is sent to the phone.
+    var fallbackURL: String? = nil
+    /// Identifies a fal-only primary even when the launcher selected a non-default port.
+    var provider: String? = nil
 
     static let file = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("object-server.json")
@@ -25,16 +30,16 @@ private struct ObjectServerError: LocalizedError {
     var errorDescription: String? { message }
 }
 
-/// One of SAM 3's mask candidates for a tap.
+/// One of SAM 3's mask candidates for a set of points on the same object.
 struct ObjectMask {
     let overlay: UIImage
     let score: Float
     let area: Float
 }
 
-/// Object mode: take one photo, tap the object to see SAM 3's mask, then have
-/// SAM 3D Objects turn it into a model. Both run on the Colab VM behind
-/// ObjectServer/server.py; models are saved in Documents/Objects.
+/// Object mode: take one photo, mark one object with one or more points, then
+/// have SAM 3D Objects turn it into a model. The provider stays behind the
+/// object-server API; models are saved in Documents/Objects.
 @MainActor
 final class ObjectCapture: ObservableObject {
     enum Step: Equatable {
@@ -48,21 +53,42 @@ final class ObjectCapture: ObservableObject {
 
     @Published private(set) var step = Step.aiming
     @Published private(set) var photo: UIImage?
-    /// The last tap, 0...1 across the upright photo.
-    @Published private(set) var tap: CGPoint?
+    /// Positive SAM points, 0...1 across the upright photo. Every point
+    /// belongs to the same object and progressively refines its mask.
+    @Published private(set) var taps: [CGPoint] = []
+    /// Centre of all positive points, used as the model reveal's screen origin.
+    var selectionOrigin: CGPoint {
+        guard !taps.isEmpty else { return CGPoint(x: 0.5, y: 0.5) }
+        let sum = taps.reduce(CGPoint.zero) { partial, point in
+            CGPoint(x: partial.x + point.x, y: partial.y + point.y)
+        }
+        return CGPoint(x: sum.x / CGFloat(taps.count), y: sum.y / CGFloat(taps.count))
+    }
     /// Largest first.
     @Published private(set) var masks: [ObjectMask] = []
     @Published var chosenMask: Int?
     /// The model ModelReveal is showing, if any.
     @Published var revealURL: URL?
     @Published private(set) var modelURL: URL?
+    /// Non-nil after the generated model has also been uploaded to My Objects.
+    @Published private(set) var libraryName: String?
     @Published var errorMessage: String?
     @Published private(set) var config = ObjectServerConfig.load()
 
     private var rawPhoto: CGImage?
     private var photoJPEG: Data?
     private var photoID: String?
+    /// The provider that owns `photoID`. Photo IDs are provider-local, so all
+    /// selection/generation requests must stay on the server that accepted
+    /// the original upload.
+    private var activeServer: ActiveServer?
     private var task: Task<Void, Never>?
+
+    private struct ActiveServer {
+        let url: String
+        let token: String
+        let label: String
+    }
 
     func reloadConfig() {
         config = ObjectServerConfig.load()
@@ -107,6 +133,7 @@ final class ObjectCapture: ObservableObject {
         task?.cancel()
         clearSelection()
         photoID = nil
+        activeServer = nil
         step = .uploading
         task = Task {
             do {
@@ -118,7 +145,8 @@ final class ObjectCapture: ObservableObject {
                 let body: [String: Any] = ["entry": entry, "image": jpeg.base64EncodedString(),
                                            "depth": depth.base64EncodedString(),
                                            "confidence": confidenceData.base64EncodedString()]
-                let added: PhotoReply = try await send("POST", "photos", body)
+                let (added, server) = try await uploadPhoto(body)
+                activeServer = server
                 photoID = added.id
                 photo = UIImage(cgImage: raw, scale: 1, orientation: Self.orientation(turns: added.turns))
                 step = .choosing
@@ -128,16 +156,21 @@ final class ObjectCapture: ObservableObject {
         }
     }
 
-    /// Asks SAM 3 for the object under `point` (0...1 across the photo).
+    /// Adds a positive point to the current object, then asks SAM 3 to refine
+    /// one mask using every point collected so far.
     func select(at point: CGPoint) {
         guard let photoID, [.choosing, .selecting, .done].contains(step) else { return }
         task?.cancel()
-        tap = point
+        taps.append(CGPoint(x: min(max(point.x, 0), 1), y: min(max(point.y, 0), 1)))
+        let selectedPoints = taps
         step = .selecting
         task = Task {
             do {
+                let points = selectedPoints.map {
+                    ["x": Double($0.x), "y": Double($0.y), "label": 1] as [String: Any]
+                }
                 let reply: SelectReply = try await send("POST", "photos/\(photoID)/select",
-                                                        ["x": point.x, "y": point.y])
+                                                        ["points": points])
                 masks = reply.masks.compactMap { mask in
                     Data(base64Encoded: mask.overlay).flatMap(UIImage.init(data:)).map {
                         ObjectMask(overlay: $0, score: mask.score, area: mask.area)
@@ -151,7 +184,15 @@ final class ObjectCapture: ObservableObject {
         }
     }
 
-    func generate() {
+    /// Starts a new selection on the same photo without uploading it again.
+    func clearPoints() {
+        guard photoID != nil else { return }
+        task?.cancel()
+        clearSelection()
+        step = .choosing
+    }
+
+    func generate(account: Account) {
         guard let photoID, let chosenMask, step == .choosing else { return }
         Diagnostics.action("object generate")
         task?.cancel()
@@ -173,6 +214,18 @@ final class ObjectCapture: ObservableObject {
                 let jpeg = photoJPEG
                 let url = try await Task.detached { try ObjectFiles.save(ply: ply, photo: jpeg) }.value
                 modelURL = url
+                libraryName = nil
+                step = .generating("Adding to My Objects")
+                let automaticName = "SAM 3D Object"
+                do {
+                    try await account.save(model: url, thumbnail: photo, name: automaticName)
+                    libraryName = automaticName
+                } catch {
+                    // Keep the generated model usable even if the cloud is
+                    // briefly unavailable. ModelReveal leaves its Save button
+                    // visible so the user can retry the library upload.
+                    errorMessage = "The 3D object was created, but My Objects could not save it: \(error.localizedDescription)"
+                }
                 revealURL = url
                 step = .done
             } catch {
@@ -188,11 +241,12 @@ final class ObjectCapture: ObservableObject {
         rawPhoto = nil
         photoJPEG = nil
         photoID = nil
+        activeServer = nil
         step = .aiming
     }
 
     private func clearSelection() {
-        tap = nil
+        taps = []
         masks = []
         chosenMask = nil
     }
@@ -227,13 +281,53 @@ final class ObjectCapture: ObservableObject {
         try JSONDecoder().decode(Reply.self, from: await data(method, path, body))
     }
 
+    /// Picture mode uses the same provider policy as Clean: local SAM first,
+    /// then the configured fal.ai gateway. The chosen provider owns the
+    /// complete photo/mask/model session.
+    private func uploadPhoto(_ body: [String: Any]) async throws -> (PhotoReply, ActiveServer) {
+        guard let config else { throw ObjectServerError(message: "No object server is set up.") }
+        var candidates = [ActiveServer(url: config.url, token: config.token,
+                                       label: config.provider == "fal.ai" ? "fal.ai" : "Local SAM 3D")]
+        if let fallback = config.fallbackURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !fallback.isEmpty, fallback != config.url {
+            candidates.append(.init(url: fallback, token: config.token, label: "fal.ai"))
+        }
+        var failures: [String] = []
+        for candidate in candidates {
+            do {
+                let reply = try JSONDecoder().decode(
+                    PhotoReply.self,
+                    from: await data("POST", "photos", body, server: candidate))
+                Diagnostics.log("picture SAM provider: \(candidate.label)")
+                return (reply, candidate)
+            } catch {
+                failures.append("\(candidate.label): \(error.localizedDescription)")
+                Diagnostics.log("picture SAM provider \(candidate.label) unavailable: \(error)")
+            }
+        }
+        throw ObjectServerError(message: failures.joined(separator: "; "))
+    }
+
     private func data(_ method: String, _ path: String, _ body: [String: Any]? = nil) async throws -> Data {
-        guard let config, let base = URL(string: config.url) else {
+        let server = activeServer ?? config.map {
+            ActiveServer(url: $0.url, token: $0.token,
+                         label: $0.provider == "fal.ai" ? "fal.ai" : "Local SAM 3D")
+        }
+        guard let server else {
             throw ObjectServerError(message: "No object server is set up.")
+        }
+        return try await data(method, path, body, server: server)
+    }
+
+    private func data(_ method: String, _ path: String, _ body: [String: Any]? = nil,
+                      server: ActiveServer) async throws -> Data {
+        guard let base = URL(string: server.url) else {
+            throw ObjectServerError(message: "The \(server.label) address is invalid.")
         }
         var request = URLRequest(url: base.appending(path: path))
         request.httpMethod = method
-        request.setValue(config.token, forHTTPHeaderField: "X-Token")
+        request.timeoutInterval = method == "POST" ? 120 : 30
+        request.setValue(server.token, forHTTPHeaderField: "X-Token")
         if let body {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -242,7 +336,7 @@ final class ObjectCapture: ObservableObject {
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200 else {
             let message = (try? JSONDecoder().decode(ErrorReply.self, from: data))?.error ?? "HTTP \(status)"
-            throw ObjectServerError(message: "Object server: \(message)")
+            throw ObjectServerError(message: "\(server.label): \(message)")
         }
         return data
     }

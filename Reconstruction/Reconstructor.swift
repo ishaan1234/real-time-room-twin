@@ -9,6 +9,14 @@ struct ReconstructionSettings {
     /// ARConfidenceLevel raw value: 0 low, 1 medium, 2 high.
     var minConfidence: UInt32 = 2
     var maxWeight: Float = 64
+    /// Only voxels this close to the surface take colour. Further out, a
+    /// voxel seen at an angle samples a neighbouring spot of the surface,
+    /// which blurs edges and patterns.
+    var colorBandInVoxels: Float = 2
+    /// Colour averages over at most this many frames' worth, so later,
+    /// closer and sharper views can still replace earlier ones. (At most 15:
+    /// the weight is kept in sixteenths in a byte.)
+    var maxColorWeight: Float = 12
     /// Corners closer than this to the surface may be flipped by the paper's
     /// Hamming refinement (try 0.3). Off by default: neighbouring cubes snap
     /// independently, and on surfaces near a voxel plane both sides snap,
@@ -33,6 +41,9 @@ struct FrameInput {
     var colorIntrinsics: simd_float3x3
     /// ARCamera.transform: camera to world, camera looks down -z with +y up.
     var cameraToWorld: simd_float4x4
+    /// How much this frame's colour counts, 0...1: less when the camera moved
+    /// during the exposure and the picture is smeared.
+    var colorWeight: Float = 1
 }
 
 struct ReconstructionStats {
@@ -43,6 +54,15 @@ struct ReconstructionStats {
     var retriangulatedCubes = 0
     var overflow: Int32 = 0
     var gpuMilliseconds = 0.0
+    /// Measured Metal view draws and TSDF integrations over the last report window.
+    var framesPerSecond = 0.0
+    var integrationsPerSecond = 0.0
+    /// Current process footprint. This is more useful on device than the
+    /// buffers' fixed allocation size because RoomPlan also consumes memory.
+    var memoryMegabytes = 0.0
+    /// ProcessInfo.ThermalState.rawValue, kept as an Int so this core type
+    /// remains independent of UIKit/Foundation UI formatting.
+    var thermalState = 0
 }
 
 enum ReconstructionError: Error {
@@ -297,6 +317,9 @@ final class Reconstructor {
         u.maxDepth = settings.maxDepth
         u.maxWeight = settings.maxWeight
         u.refineThreshold = settings.voxelSize * settings.refineThresholdInVoxels
+        u.colorBand = settings.voxelSize * settings.colorBandInVoxels
+        u.maxColorWeight = min(settings.maxColorWeight, 15)
+        u.colorWeight = frame.colorWeight
         u.minConfidence = settings.minConfidence
         u.frameIndex = frameIndex
         u.hashMask = UInt32(settings.hashSlots - 1)

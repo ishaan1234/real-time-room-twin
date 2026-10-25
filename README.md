@@ -25,7 +25,8 @@ Spatial Hashing* (ICRA 2018), in Metal.
 You need a device with LiDAR: iPhone 12 Pro or a later Pro model, or an iPad Pro.
 
 **In the app:** the camera view opens paused. Tap **Start Scan** and pick the kind of scan:
-**Detailed Mesh** (below) or **Room Layout** (RoomPlan, further down).
+**Detailed Mesh** (below), **Room Layout** (RoomPlan, further down), **Hybrid**, or
+**SAM Furniture**.
 
 With Detailed Mesh, move slowly and the mesh builds up over the camera view. Frames are only added
 while ARKit is tracking normally; otherwise a hint above the buttons says why (moving too fast, not
@@ -182,6 +183,79 @@ else is a coloured box. Then the same buttons as a mesh scan:
 
 Room Layout scans don't record keyframes, so the Colab furniture pipeline doesn't run on them.
 
+## Hybrid scan
+
+Hybrid runs the existing coloured Detailed Mesh reconstruction and RoomPlan semantics from one
+shared `ARSession` (iOS 17 or later). The Metal view and camera request 30 FPS; fusion is capped at
+30 updates per second, falls to 15 at a serious thermal state, and falls to 8 at a critical state.
+The scan overlay reports measured render/fusion FPS, GPU time, process memory, thermal state and
+triangle count. RoomPlan's live walls, openings and object boxes are drawn by the same Metal render
+pass and projected from the same AR frame as the detailed mesh. The white guidance therefore tracks
+the camera at 30 FPS instead of lagging behind in a separate SwiftUI overlay, and both scan results
+remain visible without a second camera view. Detailed Mesh and Room Layout keep their original
+performance and behaviour.
+
+Tap **Finish** to stop fusion and ask `RoomBuilder` for RoomPlan's final room without pausing the
+shared AR session. RoomPlan then supplies the authoritative clean walls, floor, openings and
+independent furniture. Large semantic triangles are subdivided to a roughly 12 cm grid, and colours
+from nearby, similarly oriented Detailed Mesh vertices are sampled onto that grid. Areas hidden by
+detected furniture retain the flat RoomPlan surface colour, so moving a table reveals a complete
+floor or wall rather than a hole in the fused scan.
+
+RoomPlan furniture uses the same Orbit/Walk selection, gizmo, voice, hand tracking, undo/redo,
+material, replace and delete code as other editable furniture. Hybrid export includes the
+edited USDZ, raw PLY and a `.roomplan.json` semantic sidecar. If RoomPlan fails or the phone gets
+too hot for it, the Detailed Mesh result remains available.
+
+Hybrid deliberately does not claim to recover exact furniture triangles from the fused LiDAR mesh:
+RoomPlan doesn't provide such a mask. It prioritizes stable editable topology and transfers the
+captured appearance where the two reconstructions agree spatially.
+
+### Clean scan
+
+Clean combines Hybrid's authoritative RoomPlan geometry with SAM Furniture's manual replacement
+workflow. Walls, floors, openings and unphotographed objects come from RoomPlan; the LiDAR mesh is
+used only as a colour/texture sample source and its irregular geometry is not included in the final
+Clean preview. Photographed furniture is replaced before the result is revealed. Structural guides
+remain white, while furniture follows the red / yellow-at-60% / green capture states described
+below. Clean exports the raw detailed PLY as a source sidecar, the RoomPlan JSON, the final edited
+USDZ, and a SAM manifest identifying the clean output mode.
+
+### SAM Furniture scan
+
+SAM Furniture also captures Detailed Mesh and RoomPlan from one shared session, but it deliberately
+uses them differently. The coloured LiDAR mesh remains the authoritative room, including the wall,
+floor and irregular surface detail. RoomPlan is used only as the list and oriented bounds of
+furniture that may be replaced.
+
+While scanning, an item becomes eligible only after its RoomPlan box has remained stable and at
+least 60% of that box is inside the phone viewport. Furniture boxes are red while a manual photo is
+still needed, yellow once they meet the 60% rule, and green after a photo is safely written. The user
+must tap **Photo** while a box is yellow; RoomTwin rejects the shot otherwise. It saves exactly one
+colour/depth frame for the best visible yellow item and never photographs furniture automatically.
+The live status shows `captured / detected`; turn every intended item green before tapping
+**Finish**.
+
+After Finish, RoomTwin hides the unfinished detailed scan and completes replacement before opening
+the result. The progress card names each real stage: finalizing RoomPlan, preparing the detailed
+mesh, connecting to the server, uploading the item's one photo, finding the object inside its
+projected RoomPlan box, building it with SAM 3D Objects, downloading it, repairing the newly exposed
+surface, and building the editable preview. If the server is unavailable, no partial result is
+shown; the user can start the server and tap **Retry** without rescanning.
+
+Export remains available for archiving and includes a `.sam.json` marker beside the raw `.ply` and
+`.roomplan.json`. With that marker present, SAM 3 only asks for categories RoomPlan actually detected. Every image mask must
+overlap the matching projected RoomPlan box, and every lifted scan vertex must remain inside that
+specific object's 3D box. This prevents an unrelated object from being added and keeps two nearby
+pieces of the same category independent. A detected object with no sufficiently clear photo or
+mesh evidence is left unchanged.
+
+After SAM 3D Objects successfully generates a replacement, only that object's scanned triangles are
+removed. A small RoomPlan floor or wall patch is added immediately behind the removed object, using
+colour sampled from the surrounding detailed mesh. RoomPlan does not flatten or replace the rest of
+the room. This gives the useful "flat surface behind a moved table" behaviour while retaining the
+detailed scan everywhere else.
+
 ## Objects: Photo and Walk Around
 
 The switch at the top has two ways to turn one object into a 3D model. Either way, when the model is
@@ -195,7 +269,9 @@ takes photos. Then tap **Finish**, or **Another Pass** to go round again higher 
 builds a textured model in a few minutes. Shiny, see-through and very thin objects don't work well.
 The photos stay in the capture's folder, so a Mac can rebuild them at higher detail.
 
-**Photo** needs only one photo, but runs on the Colab GPU. Take a photo and tap the object: SAM 3
+**Photo** needs only one photo. Take a photo and tap one or more visible parts of the same object:
+every blue numbered point refines a single SAM 3 mask. Use **Clear** to start the selection again without
+retaking or re-uploading the photo. SAM 3
 masks it, and **Large / Medium / Small** pick between its three guesses (a whole chair, its seat, …).
 Tap **Generate 3D** and SAM 3D Objects builds the full object, back included, in about 30 seconds,
 guessing the sides it can't see. The LiDAR depth sets its real size.
@@ -213,6 +289,13 @@ set up with `Furniture/colab_setup.sh`, and tunnels them to the Mac's Wi-Fi addr
 Photo mode. Ctrl-C stops both models and frees the GPU for the room pipeline. If the phone isn't
 connected, the script prints the address and token, and you type them in after tapping the server
 button in Photo mode.
+
+For an automatic hosted fallback, add `FALKEY=...` to `.env.local` and install Assimp once with
+`brew install assimp`. `start.sh` then also runs a small authenticated gateway on the Mac. RoomTwin
+prefers the self-hosted Colab models; if that server is unavailable, a request fails, or generation
+times out, it retries the same manually captured image with `fal-ai/sam-3/3d-objects`. The fallback
+uses the RoomPlan box as fal's box prompt, fits the returned mesh back into that box, and keeps the
+original RoomPlan direction. The fal key remains on the Mac and is never copied into the app.
 
 ### RoomTwin Viewer on the Mac
 
@@ -244,6 +327,7 @@ The script copies the scan off the phone and runs four steps on the Colab GPU. T
 `scans/<scan>/twin/room_twin.usdz`, which opens in Quick Look.
 
 1. `segment.py`: SAM 3 masks furniture in every keyframe from text prompts (chair, sofa, table, …).
+   In a SAM Furniture scan, prompts and detections are restricted to the exported RoomPlan targets.
 2. `lift.py`: each keyframe votes on which scan vertices belong to which piece. Floor-height
    vertices never count, since masks spill onto the floor. The step also picks each piece's most
    complete, unclipped view.
@@ -251,11 +335,14 @@ The script copies the scan off the phone and runs four steps on the Colab GPU. T
    LiDAR depth sets its size, and the predicted pose moves it into the room.
 4. `assemble.py`: fits each model to its scanned surface with ICP, rigid unless the scan covers most
    of the model, and drops it onto the floor. It removes the scanned piece and writes
-   `room_twin.ply` along with the fitted objects and `placement.json`.
+   `room_twin.ply` along with the fitted objects and `placement.json`. For SAM Furniture exports it
+   also fills only the local RoomPlan floor/wall area hidden by each successfully replaced target.
 
 `debug/` shows the photo each model came from. Rerun single steps on the VM with
 `run_pipeline.sh SCAN generate assemble`, and use `assemble.py --keep 3` to leave object 3 as
-scanned. `python3 Furniture/synthetic_test.py` checks steps 2 and 4 on a synthetic room, with no GPU.
+scanned. `python3 Furniture/synthetic_test.py` checks the original steps 2 and 4 on a synthetic
+room, with no GPU. `python3 Furniture/sam_mode_test.py` checks target restriction and local surface
+repair for the SAM Furniture mode.
 
 SAM 3D Objects needs Linux and an NVIDIA GPU with at least 32 GB, so this runs on a Colab A100.
 `Furniture/colab_setup.sh` prepares a fresh VM in about 20 minutes and needs Hugging Face access

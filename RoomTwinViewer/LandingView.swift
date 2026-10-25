@@ -2,9 +2,9 @@ import SwiftUI
 
 /// The overlay's content: nothing while waiting; when a model arrives the
 /// screen greys out and the model flies up from the bottom edge, lands and
-/// spins. Drag it to turn it and scroll or pinch to zoom. A preloaded model
-/// waits loaded just below the bottom edge, and the same view flies up when
-/// it's shown, so nothing has to load then.
+/// spins. Drag it to turn it, and pinch to zoom as in a browser. A preloaded
+/// model waits loaded just below the bottom edge, and the same view flies up
+/// when it's shown, so nothing has to load then.
 struct LandingView: View {
     @ObservedObject var viewer: Viewer
 
@@ -15,10 +15,9 @@ struct LandingView: View {
                 .contentShape(Rectangle())
                 .onTapGesture(perform: viewer.dismiss)
             ForEach(viewer.models) { model in
-                LandingModel(arrival: model, isShown: model.id == viewer.arrival?.id, shakes: viewer.shakes) {
-                    viewer.stagedIsReady(model.id)
-                }
-                .transition(.move(edge: .bottom).combined(with: .opacity))
+                LandingModel(arrival: model, isShown: model.id == viewer.arrival?.id, shakes: viewer.shakes,
+                             onReady: { viewer.stagedIsReady(model.id) }, onDismiss: viewer.dismiss)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
         .animation(.easeInOut(duration: 0.4), value: viewer.arrival)
@@ -32,12 +31,18 @@ private struct LandingModel: View {
     let isShown: Bool
     let shakes: Int
     let onReady: () -> Void
+    /// A click on the clear space round the model.
+    let onDismiss: () -> Void
     @State private var landed = false
 
     var body: some View {
         GeometryReader { geometry in
             let side = min(geometry.size.width, geometry.size.height) * 0.7
             let spot = CGPoint(x: geometry.size.width / 2, y: geometry.size.height * 0.46)
+            // The model's view fills the screen, so zooming in never cuts it
+            // off; a wider view angle keeps it the size it would be in a
+            // side-by-side view at the usual 35 degrees.
+            let fieldOfView = 2 * atan(tan(35 / 2 * CGFloat.pi / 180) * geometry.size.height / side) * 180 / .pi
             ZStack {
                 // Its shadow on the "ground", there once it has landed.
                 Ellipse()
@@ -48,16 +53,18 @@ private struct LandingModel: View {
                     .opacity(landed ? 1 : 0)
                     .scaleEffect(landed ? 1 : 0.3)
                     .allowsHitTesting(false)
-                SpinningModel(url: arrival.model, isPlaying: isShown, onReady: onReady)
-                    .frame(width: side, height: side)
+                SpinningModel(url: arrival.model, isPlaying: isShown, onReady: onReady,
+                              fieldOfView: fieldOfView, onEmptyClick: onDismiss)
+                    .frame(width: geometry.size.width, height: geometry.size.height)
                     .scaleEffect(landed ? 1 : 0.55)
                     .modifier(Shake(animatableData: CGFloat(shakes)))
-                    .position(x: spot.x, y: landed ? spot.y : geometry.size.height + side / 2)
+                    .position(x: spot.x, y: landed ? spot.y : geometry.size.height * 1.5)
                 VStack(spacing: 6) {
                     Spacer()
                     Text(arrival.model.deletingPathExtension().lastPathComponent)
                         .font(.title2.weight(.semibold))
-                    Text("from \(arrival.from) · drag to turn, scroll to zoom · click outside it or press Esc to close")
+                    Text("from \(arrival.from) · drag to turn · pinch to zoom, double-tap with two fingers to reset · "
+                         + "click outside it or press Esc to close")
                         .foregroundStyle(.white.opacity(0.7))
                 }
                 .foregroundStyle(.white)

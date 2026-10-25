@@ -41,7 +41,8 @@ enum RoomPlanMesh {
             } else {
                 builder.addBox(object)
             }
-            builder.mesh.editableObjects.append(.init(name: label, faces: firstFace..<builder.mesh.faces.count))
+            builder.mesh.editableObjects.append(.init(name: label,
+                                                       faces: Array(firstFace..<builder.mesh.faces.count)))
         }
         return builder.mesh
     }

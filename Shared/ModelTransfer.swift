@@ -12,6 +12,15 @@ enum ModelTransfer {
     /// Bonjour type `_roomtwin-model._tcp`; both Info.plists list it under NSBonjourServices.
     static let serviceType = "roomtwin-model"
 
+    /// What a Viewer advertises when it can take preloads. An older one
+    /// shows a preload as soon as it arrives and never says it's ready, so
+    /// the phone only offers Pre-load to a Mac advertising this.
+    static let discoveryInfo = ["preload": "1"]
+
+    static func canPreload(_ info: [String: String]?) -> Bool {
+        info?["preload"] == discoveryInfo["preload"]
+    }
+
     /// A short message between the phone and the Mac, sent as JSON data.
     struct Message: Codable {
         enum Kind: String, Codable {

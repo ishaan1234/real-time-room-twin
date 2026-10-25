@@ -9,8 +9,10 @@ struct MeshSnapshot {
     struct EditableObject {
         /// Human-readable RoomPlan category, made unique within the room.
         var name: String
-        /// Faces occupied by this object in the untouched snapshot.
-        var faces: Range<Int>
+        /// Faces occupied by this object in the untouched snapshot. The face
+        /// list is explicit rather than assumed contiguous, so semantic and
+        /// imported geometry can use the same edit pipeline.
+        var faces: [Int]
     }
 
     var positions: [SIMD3<Float>] = []
@@ -18,8 +20,8 @@ struct MeshSnapshot {
     var faces: [SIMD3<UInt32>] = []
     /// Pool index of each snapshot vertex.
     var poolIndices: [Int32] = []
-    /// Named object ranges are populated by RoomPlan. Detailed LiDAR meshes
-    /// have no semantic object labels, so this remains empty for them.
+    /// Named object groups are populated by RoomPlan or Hybrid segmentation.
+    /// Plain Detailed Mesh scans have no semantic labels, so this stays empty.
     var editableObjects: [EditableObject] = []
 }
 

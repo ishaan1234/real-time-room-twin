@@ -29,6 +29,8 @@ final class ModelSender: NSObject, ObservableObject {
     /// drop so buttons don't blink out under a finger, and cleared once it's
     /// gone from the network.
     @Published private(set) var knownMac: String?
+    /// Macs whose Viewer is new enough to take preloads (see ModelTransfer.discoveryInfo).
+    @Published private(set) var preloadingMacs = Set<MCPeerID>()
     /// The last send's outcome, for a short toast.
     @Published var status: String?
     @Published private var preload: Preload?
@@ -62,12 +64,18 @@ final class ModelSender: NSObject, ObservableObject {
         return preload.failure.map(PreloadState.failed) ?? .none
     }
 
-    /// Sends the model to every connected Mac to load out of sight, so a
-    /// swipe shows it at once.
+    /// Whether the Mac by this name can take preloads.
+    func canPreload(on mac: String) -> Bool {
+        preloadingMacs.contains { $0.displayName == mac }
+    }
+
+    /// Sends the model to every connected Mac that takes preloads, to load
+    /// out of sight, so a swipe shows it at once.
     func preload(_ model: URL, name: String) {
-        let targets = session.connectedPeers
+        let targets = session.connectedPeers.filter { preloadingMacs.contains($0) }
         guard !targets.isEmpty else {
-            status = "No Mac nearby. Open RoomTwin Viewer on your Mac."
+            status = session.connectedPeers.isEmpty ? "No Mac nearby. Open RoomTwin Viewer on your Mac."
+                : "Update RoomTwin Viewer on your Mac to pre-load."
             return
         }
         Diagnostics.action("preload model on \(targets.map(\.displayName))")
@@ -83,14 +91,27 @@ final class ModelSender: NSObject, ObservableObject {
         self.preload?.pending.insert(mac)
         session.sendResource(at: preload.model, withName: ModelTransfer.resourceName(preload.name, preloadID: id),
                              toPeer: mac) { [weak self] error in
-            guard let error else { return }   // Then the Mac says when it's ready.
             DispatchQueue.main.async {
-                guard let self, self.preload?.id == id, self.session.connectedPeers.contains(mac) else { return }
-                self.preload?.pending.remove(mac)
-                self.preload?.showWhenReady.remove(mac)
-                self.preload?.failure = "Couldn't reach \(mac.displayName): \(error.localizedDescription)"
+                guard let self, self.preload?.id == id else { return }
+                if let error {
+                    guard self.session.connectedPeers.contains(mac) else { return }
+                    self.givePreloadUp(on: mac, "Couldn't reach \(mac.displayName): \(error.localizedDescription)")
+                    return
+                }
+                // The Mac says when it has loaded it; it shouldn't take long.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 20) {
+                    guard self.preload?.id == id, self.preload?.pending.contains(mac) == true,
+                          self.session.connectedPeers.contains(mac) else { return }
+                    self.givePreloadUp(on: mac, "\(mac.displayName) didn't load it")
+                }
             }
         }
+    }
+
+    private func givePreloadUp(on mac: MCPeerID, _ reason: String) {
+        preload?.pending.remove(mac)
+        preload?.showWhenReady.remove(mac)
+        preload?.failure = reason
     }
 
     /// Shows the model on every connected Mac: at once where it's preloaded,
@@ -157,6 +178,11 @@ final class ModelSender: NSObject, ObservableObject {
 extension ModelSender: MCNearbyServiceBrowserDelegate {
     func browser(_ browser: MCNearbyServiceBrowser, foundPeer peerID: MCPeerID, withDiscoveryInfo info: [String: String]?) {
         DispatchQueue.main.async {
+            if ModelTransfer.canPreload(info) {
+                self.preloadingMacs.insert(peerID)
+            } else {
+                self.preloadingMacs.remove(peerID)
+            }
             // Browsing afresh finds the Macs already connected too. Inviting one of
             // those, or one still answering, drops its connection, and the drop
             // would start browsing afresh again, round and round.
@@ -198,7 +224,9 @@ extension ModelSender: MCSessionDelegate {
                 // A preload cut off by a drop goes again, and one made before
                 // this Mac turned up goes to it too. One it has ready stays ready:
                 // the Viewer keeps it through a drop, and says if it hasn't.
-                if let preload = self.preload, !preload.ready.contains(peerID) { self.sendPreload(to: peerID) }
+                if let preload = self.preload, !preload.ready.contains(peerID), self.preloadingMacs.contains(peerID) {
+                    self.sendPreload(to: peerID)
+                }
             case .notConnected:
                 // The preload's progress is kept, so the button doesn't reset.
                 self.browseAgain()

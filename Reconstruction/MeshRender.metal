@@ -35,3 +35,20 @@ fragment float4 meshFragment(MeshFragmentIn in [[stage_in]],
     }
     return float4(in.color * (0.6 + 0.4 * facing), 1.0);
 }
+
+struct RoomGuideOut {
+    float4 position [[position]];
+};
+
+vertex RoomGuideOut roomGuideVertex(uint vid [[vertex_id]],
+                                    constant float4* positions [[buffer(0)]],
+                                    constant MeshUniforms& u [[buffer(1)]]) {
+    RoomGuideOut out;
+    out.position = u.viewProjection * positions[vid];
+    return out;
+}
+
+fragment float4 roomGuideFragment(RoomGuideOut in [[stage_in]],
+                                  constant float4& color [[buffer(0)]]) {
+    return color;
+}

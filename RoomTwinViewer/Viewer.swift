@@ -40,7 +40,8 @@ final class Viewer: NSObject, ObservableObject {
         return session
     }()
     private lazy var advertiser: MCNearbyServiceAdvertiser = {
-        let advertiser = MCNearbyServiceAdvertiser(peer: peer, discoveryInfo: nil, serviceType: ModelTransfer.serviceType)
+        let advertiser = MCNearbyServiceAdvertiser(peer: peer, discoveryInfo: ModelTransfer.discoveryInfo,
+                                                   serviceType: ModelTransfer.serviceType)
         advertiser.delegate = self
         return advertiser
     }()

@@ -1,5 +1,6 @@
 import ARKit
 import MetalKit
+import RoomPlan
 import SwiftUI
 
 struct ExportedFile: Identifiable {
@@ -14,6 +15,7 @@ final class ScanController: ObservableObject {
     /// False until the first tap on Start Scan; the camera runs but nothing is fused.
     @Published private(set) var hasStarted = false
     @Published private(set) var isScanning = false
+    @Published private(set) var profile = ScanPerformanceProfile.detailed
     @Published private(set) var viewMode = MeshViewMode.color
     @Published private(set) var isExporting = false
     /// The scan as a 3D scene to look round, while the preview is open.
@@ -23,6 +25,9 @@ final class ScanController: ObservableObject {
     @Published private(set) var isPreparingPreview = false
     /// Why frames aren't being fused right now, if tracking isn't normal.
     @Published private(set) var trackingHint: String?
+    @Published private(set) var hybridExtractionSummary: String?
+    @Published private(set) var samFurniturePhotoSummary: String?
+    @Published private(set) var samFurnitureCanCapture = false
     @Published var exportedFile: ExportedFile?
     @Published var errorMessage: String?
 
@@ -34,6 +39,12 @@ final class ScanController: ObservableObject {
     /// Each scan gets a folder in Documents with its keyframes and exports.
     private var keyframes: KeyframeRecorder?
     private var isActive = true
+    /// Final RoomPlan semantics for a Hybrid scan. RoomPlan supplies the clean
+    /// authoritative topology; the detailed mesh supplies captured colour and
+    /// remains available as the raw PLY/export fallback.
+    private var hybridRoom: CapturedRoom?
+    private var hybridOutputMode: HybridOutputMode?
+    private var samFurnitureStates: [UUID: FurniturePhotoState] = [:]
     private static let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
 
     init() {
@@ -81,9 +92,13 @@ final class ScanController: ObservableObject {
         isExporting || isPreparingPreview
     }
 
-    func startScanning() {
+    func startScanning(profile: ScanPerformanceProfile = .detailed,
+                       keyframeMode: KeyframeRecorder.Mode = .continuous) {
+        self.profile = profile
+        renderer?.use(profile)
+        renderer?.setRoomPlanGuide([])
         hasStarted = true
-        startRecording()
+        startRecording(mode: keyframeMode)
         setScanning(true)
         Diagnostics.action("start scan")
     }
@@ -91,6 +106,47 @@ final class ScanController: ObservableObject {
     func toggleScanning() {
         setScanning(!isScanning)
         Diagnostics.action(isScanning ? "scan" : "pause")
+    }
+
+    func pauseScanning() {
+        setScanning(false)
+    }
+
+    func installHybridRoom(_ room: CapturedRoom, outputMode: HybridOutputMode = .semanticRoom) {
+        hybridRoom = room
+        hybridOutputMode = outputMode
+        hybridExtractionSummary = nil
+        samFurniturePhotoSummary = nil
+        samFurnitureCanCapture = false
+        samFurnitureStates = [:]
+        isPreviewStale = true
+    }
+
+    func updateHybridGuide(_ room: CapturedRoom, furnitureOnly: Bool = false) {
+        let surfaces = furnitureOnly ? [] : (room.walls + room.doors + room.windows + room.openings + room.floors)
+            .map { RoomPlanGuideBox(transform: $0.transform, dimensions: $0.dimensions, identifier: nil) }
+        let objects = room.objects.map {
+            RoomPlanGuideBox(transform: $0.transform, dimensions: $0.dimensions,
+                             identifier: $0.identifier,
+                             state: samFurnitureStates[$0.identifier] ?? .detected)
+        }
+        let boxes = surfaces + objects
+        renderer?.setRoomPlanGuide(boxes)
+    }
+
+    func updateSAMFurnitureTargets(_ objects: [CapturedRoom.Object]) {
+        keyframes?.updateFurniture(objects)
+    }
+
+    @discardableResult
+    func captureSAMFurniturePhoto() -> Bool {
+        let accepted = keyframes?.requestFurniturePhoto() == true
+        if accepted {
+            Diagnostics.action("SAM furniture photo")
+        } else {
+            samFurniturePhotoSummary = "Move a red box fully into frame; yellow means ready"
+        }
+        return accepted
     }
 
     /// The camera's latest frame, for Object mode's photo.
@@ -135,6 +191,15 @@ final class ScanController: ObservableObject {
         isPreviewOpen = false
         isARPreviewActive = false
         hasStarted = false
+        hybridRoom = nil
+        hybridOutputMode = nil
+        hybridExtractionSummary = nil
+        samFurniturePhotoSummary = nil
+        samFurnitureCanCapture = false
+        samFurnitureStates = [:]
+        renderer?.setRoomPlanGuide([])
+        profile = .detailed
+        renderer?.use(.detailed)
         Diagnostics.action("reset")
     }
 
@@ -154,6 +219,8 @@ final class ScanController: ObservableObject {
         let reconstructor = renderer.reconstructor
         let folder = keyframes?.folder ?? Self.documents
         let edits = preview?.exportContents()
+        let semanticRoom = hybridRoom
+        let outputMode = hybridOutputMode
         renderer.whenGPUIdle { [weak self] in
             var stepStart = ProcessInfo.processInfo.systemUptime
             func step(_ name: String) {
@@ -166,7 +233,7 @@ final class ScanController: ObservableObject {
             let base = folder.appendingPathComponent("RoomTwin-\(Self.timestamp())")
             let ply = base.appendingPathExtension("ply")
             let usdz = base.appendingPathExtension("usdz")
-            let result = Result {
+            let result = Result { () -> [URL] in
                 try mesh.writePLY(to: ply)
                 step("PLY")
                 var exportMesh = edits?.scan ?? mesh
@@ -177,14 +244,35 @@ final class ScanController: ObservableObject {
                 }
                 try exportMesh.writeUSDZ(to: usdz, adding: edits?.nodes ?? [])
                 step("USDZ")
+                var urls = [usdz, ply]
+                if let semanticRoom {
+                    let json = base.appendingPathExtension("roomplan.json")
+                    let encoder = JSONEncoder()
+                    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                    try encoder.encode(semanticRoom).write(to: json, options: .atomic)
+                    urls.append(json)
+                    step("RoomPlan JSON")
+                    if let outputMode, outputMode.usesManualFurnitureCapture {
+                        let manifest = base.appendingPathExtension("sam.json")
+                        let value = SAMReplacementManifest(
+                            mode: outputMode,
+                            roomPlanFile: json.lastPathComponent,
+                            detailedMeshFile: ply.lastPathComponent,
+                            targetCount: semanticRoom.objects.count)
+                        try JSONEncoder().encode(value).write(to: manifest, options: .atomic)
+                        urls.append(manifest)
+                        step("SAM replacement manifest")
+                    }
+                }
+                return urls
             }
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isExporting = false
                 switch result {
-                case .success:
+                case .success(let urls):
                     Diagnostics.action("share sheet opening")
-                    self.exportedFile = ExportedFile(urls: [usdz, ply], triangles: mesh.faces.count)
+                    self.exportedFile = ExportedFile(urls: urls, triangles: mesh.faces.count)
                 case .failure(let error): self.errorMessage = "Export failed: \(error.localizedDescription)"
                 }
             }
@@ -214,21 +302,130 @@ final class ScanController: ObservableObject {
         }
     }
 
+    /// Completes SAM Furniture before any unfinished scan can be shown. The
+    /// expensive network/model work happens while HybridScan owns the progress
+    /// screen; only the final detailed-room + replacement scene is published.
+    @MainActor
+    func prepareSAMFurniture(room: CapturedRoom, outputMode: HybridOutputMode, account: Account?,
+                             progress: @escaping SAMFurnitureProcessor.Progress) async throws -> String {
+        guard let recorder = keyframes, let renderer else {
+            throw CocoaError(.fileReadUnknown, userInfo: [NSLocalizedDescriptionKey: "The SAM scan folder is unavailable."])
+        }
+        isPreparingPreview = true
+        defer { isPreparingPreview = false }
+        progress(.init(title: "Preparing the detailed room", detail: "Waiting for the last furniture photo", fraction: 0.03))
+        let photos = await recorder.furniturePhotos()
+        let detailed: MeshSnapshot = await withCheckedContinuation { continuation in
+            renderer.whenGPUIdle {
+                continuation.resume(returning: renderer.reconstructor.snapshot())
+            }
+        }
+        let replacements = try await SAMFurnitureProcessor.run(
+            folder: recorder.folder, photos: photos, progress: progress)
+        if let account {
+            progress(.init(title: "Saving SAM objects to My Objects",
+                           detail: "Every generated replacement is saved automatically", fraction: 0.945))
+            let libraryResult = await SAMGeneratedObjectLibrary.save(
+                replacements, in: recorder.folder, to: account) { detail in
+                    progress(.init(title: "Saving SAM objects to My Objects", detail: detail, fraction: 0.95))
+                }
+            if !libraryResult.failures.isEmpty {
+                errorMessage = "Some SAM objects could not be added to My Objects: "
+                    + libraryResult.failures.joined(separator: "; ")
+            }
+        }
+        let replacementBase: MeshSnapshot
+        let cleanSummary: String?
+        if outputMode == .clean {
+            progress(.init(title: "Building the clean room",
+                           detail: "Using RoomPlan geometry and sampling only colour from the mesh",
+                           fraction: 0.955))
+            let kinds = FurnitureLibrary.kinds
+            let library = Dictionary(uniqueKeysWithValues: kinds.compactMap { kind in
+                FurnitureLibrary.mesh(kind).map { (kind, $0) }
+            })
+            let semantic = await Task.detached(priority: .userInitiated) {
+                HybridSemanticMesh.build(room: room, detailed: detailed, library: library)
+            }.value
+            guard semantic.usedRoomPlanLayout else {
+                throw CocoaError(.fileReadCorruptFile, userInfo: [NSLocalizedDescriptionKey:
+                    "RoomPlan did not produce enough clean surfaces for Clean mode."])
+            }
+            replacementBase = semantic.mesh
+            cleanSummary = semantic.summary
+        } else {
+            replacementBase = detailed
+            cleanSummary = nil
+        }
+        progress(.init(title: "Fitting replacements into the room",
+                       detail: outputMode == .clean
+                           ? "Replacing RoomPlan furniture on clean textured surfaces"
+                           : "Preserving detailed walls and repairing only hidden surfaces",
+                       fraction: 0.97))
+        let result = await Task.detached(priority: .userInitiated) {
+            SAMFurnitureMesh.build(room: room, detailed: replacementBase, replacements: replacements)
+        }.value
+        guard result.replacements > 0 else {
+            throw CocoaError(.fileReadCorruptFile, userInfo: [NSLocalizedDescriptionKey:
+                "Generated models no longer matched the final RoomPlan furniture identifiers."])
+        }
+        progress(.init(title: "Building the editable preview", detail: "Almost ready", fraction: 0.99))
+        let viewer = renderer.session.currentFrame?.camera.transform
+        let newPreview = await Task.detached(priority: .userInitiated) {
+            PreviewScene(mesh: result.mesh, viewer: viewer)
+        }.value
+        preview = newPreview
+        isPreviewStale = false
+        let summary = outputMode == .clean
+            ? "Clean · \(cleanSummary ?? "RoomPlan surfaces + scan colours") · \(result.replacements) SAM replacement\(result.replacements == 1 ? "" : "s")"
+            : result.summary
+        hybridExtractionSummary = summary
+        return summary
+    }
+
+    @MainActor
+    func revealPreparedPreview() {
+        guard preview != nil else { return }
+        isARPreviewActive = false
+        isPreviewOpen = true
+        updateDrawing()
+    }
+
     /// Makes the preview from the scan as it is now. One made before, from
     /// less of the scan, hands its furniture and looks over to the new one.
     private func buildPreview(then done: @escaping () -> Void) {
         guard let renderer else { return }
         let reconstructor = renderer.reconstructor
         let viewer = renderer.session.currentFrame?.camera.transform
+        let semanticRoom = hybridRoom
+        let outputMode = hybridOutputMode
+        let furnitureKinds = FurnitureLibrary.kinds
         renderer.whenGPUIdle { [weak self] in
             let start = ProcessInfo.processInfo.systemUptime
-            let mesh = reconstructor.snapshot()
+            let raw = reconstructor.snapshot()
+            let hybrid = outputMode?.usesCleanRoomGeometry == true ? semanticRoom.map { room in
+                let library = Dictionary(uniqueKeysWithValues: furnitureKinds.compactMap { kind in
+                    FurnitureLibrary.mesh(kind).map { (kind, $0) }
+                })
+                return HybridSemanticMesh.build(room: room, detailed: raw, library: library)
+            } : nil
+            let mesh = hybrid?.mesh ?? raw
+            if let hybrid { Diagnostics.log("hybrid semantic mesh: \(hybrid.summary)") }
+            let samSummary: String?
+            if outputMode == .samFurnitureReplacement {
+                samSummary = "Detailed room preserved · \(semanticRoom?.objects.count ?? 0) detected furniture targets for SAM 3D"
+            } else if outputMode == .clean {
+                samSummary = "Clean RoomPlan surfaces · scan colours only · \(semanticRoom?.objects.count ?? 0) SAM targets"
+            } else {
+                samSummary = nil
+            }
             let preview = mesh.faces.isEmpty ? nil : PreviewScene(mesh: mesh, viewer: viewer)
             Diagnostics.log(String(format: "preview: %d triangles in %.0f ms", mesh.faces.count,
                                    (ProcessInfo.processInfo.systemUptime - start) * 1000))
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isPreviewStale = false
+                self.hybridExtractionSummary = hybrid?.summary ?? samSummary
                 if let preview {
                     if let earlier = self.preview { preview.continueEdits(from: earlier) }
                     self.preview = preview
@@ -265,9 +462,21 @@ final class ScanController: ObservableObject {
         if scanning, preview != nil { isPreviewStale = true }
     }
 
-    private func startRecording() {
+    private func startRecording(mode: KeyframeRecorder.Mode = .continuous) {
         do {
-            keyframes = try KeyframeRecorder(folder: Self.documents.appendingPathComponent("RoomTwin-\(Self.timestamp())"))
+            keyframes = try KeyframeRecorder(folder: Self.documents.appendingPathComponent("RoomTwin-\(Self.timestamp())"),
+                                             mode: mode)
+            keyframes?.onFurnitureStatus = { [weak self] captured, detected, canCapture, states in
+                guard let self else { return }
+                self.samFurnitureCanCapture = canCapture
+                self.samFurnitureStates = states
+                self.samFurniturePhotoSummary = detected == 0
+                    ? "Looking for furniture"
+                    : canCapture
+                        ? "Yellow box ready · tap Photo · \(captured) of \(detected) captured"
+                        : "\(captured) of \(detected) captured · centre a red box"
+                self.renderer?.setFurniturePhotoStates(states)
+            }
         } catch {
             keyframes = nil
             errorMessage = "Could not create the scan folder: \(error.localizedDescription)"

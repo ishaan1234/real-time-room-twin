@@ -320,7 +320,6 @@ final class HandInteractionController: ObservableObject {
     @Published private(set) var isGrabbing = false
     @Published private(set) var targetedObject: String?
     @Published private(set) var status = "Hand tracking off"
-    @Published private(set) var feedback: String?
 
     var onSelection: ((String?) -> Void)?
     var onEditCommitted: (() -> Void)?
@@ -378,7 +377,6 @@ final class HandInteractionController: ObservableObject {
         reportedLoss = false
         tracking = .searching
         status = "Looking for your hand"
-        feedback = nil
         camera.start()
     }
 
@@ -414,7 +412,6 @@ final class HandInteractionController: ObservableObject {
                 isGrabbing = true
                 targetedObject = name
                 onSelection?(name)
-                showFeedback("Grabbed \(name)")
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             }
         case .pinched:
@@ -442,8 +439,7 @@ final class HandInteractionController: ObservableObject {
     }
 
     private func releaseGrab() {
-        if let name = scene?.endHandGrab() {
-            showFeedback("Released \(name)")
+        if scene?.endHandGrab() != nil {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             onEditCommitted?()
         }
@@ -466,12 +462,5 @@ final class HandInteractionController: ObservableObject {
         scene?.clearSelection()
         onSelection?(nil)
         status = "Hand tracking off"
-    }
-
-    private func showFeedback(_ message: String) {
-        feedback = message
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-            if self?.feedback == message { self?.feedback = nil }
-        }
     }
 }

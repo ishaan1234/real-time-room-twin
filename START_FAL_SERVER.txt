@@ -1,0 +1,8 @@
+ROOMTWIN FAL.AI SERVER
+======================
+
+    USE_COLAB=0 bash ObjectServer/start.sh
+
+To use Colab first and fal.ai only as the fallback, run:
+
+    bash ObjectServer/start.sh

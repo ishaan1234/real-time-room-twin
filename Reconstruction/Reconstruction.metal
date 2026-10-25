@@ -311,15 +311,24 @@ kernel void integrateDepth(texture2d<float, access::read> depthMap [[texture(0)]
     v.y = min(v.y + 1.0, u.maxWeight);
     voxels[cube] = half2(v);
 
-    if (fabs(sdf) < u.truncation) {
+    // Colour comes only from voxels near the surface: one further out, seen
+    // at an angle, would sample a neighbouring spot. A frame counts for more
+    // the nearer the voxel is to the surface, the closer the camera, and the
+    // sharper the picture (u.colorWeight), and the average is capped low so
+    // later, better views can still take over. The weight is kept in
+    // sixteenths in the alpha byte; any weight at all marks a coloured voxel.
+    float w = u.colorWeight * (1.0 - fabs(sdf) / u.colorBand) * clamp(1.2 / z, 0.25, 1.0);
+    if (w > 0.01) {
         float2 colorPixel = ray * u.colorIntrinsics.xy + u.colorIntrinsics.zw;
         float2 uv = (colorPixel + 0.5) / float2(u.colorSize);
         if (all(uv >= 0.0) && all(uv <= 1.0)) {
             constexpr sampler s(filter::linear, address::clamp_to_edge);
             float3 rgb = ycbcrToRGB(colorY.sample(s, uv).r, colorCbCr.sample(s, uv).rg) * 255.0;
             float4 c = float4(colors[cube]);
-            float3 blended = (c.rgb * c.a + rgb) / (c.a + 1.0);
-            colors[cube] = uchar4(uchar3(clamp(blended + 0.5, 0.0, 255.0)), uchar(min(c.a + 1.0, u.maxWeight)));
+            float stored = c.a / 16.0;
+            float3 blended = (c.rgb * stored + rgb * w) / (stored + w);
+            float weight = clamp(round(min(stored + w, u.maxColorWeight) * 16.0), 1.0, 255.0);
+            colors[cube] = uchar4(uchar3(clamp(blended + 0.5, 0.0, 255.0)), uchar(weight));
         }
     }
 }

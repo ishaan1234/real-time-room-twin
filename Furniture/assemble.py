@@ -45,6 +45,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     remove_vertex = np.zeros(len(positions), bool)
     fitted, placement = [], []
+    replaced_target_ids = set()
     for path in sorted(glob.glob(os.path.join(args.scan_dir, "generated", "object_*.ply"))):
         object_id = int(os.path.basename(path)[7:9])
         if object_id in keep or object_id not in objects:
@@ -54,6 +55,8 @@ def main():
         model = model.astype(np.float64)
         scanned = positions[vertex_objects == object_id].astype(np.float64)
         report = dict(id=object_id, category=obj["category"], scanned_vertices=int(len(scanned)))
+        if "roomplan_target" in obj:
+            report["roomplan_target"] = int(obj["roomplan_target"])
 
         if not args.no_fit and len(scanned) >= 50:
             transform, before, after, coverage = fit_to_scan(model, model_faces, scanned)
@@ -82,21 +85,96 @@ def main():
         scan_io.write_ply(os.path.join(out_dir, name), model, model_colors, model_faces)
         fitted.append((model, model_colors, model_faces))
         placement.append(report)
+        if "roomplan_target" in obj:
+            replaced_target_ids.add(int(obj["roomplan_target"]))
         print("assemble: " + ", ".join(f"{k} {v}" for k, v in report.items()))
 
     keep_face = ~remove_vertex[faces].any(axis=1)
     room, room_colors, room_faces = compact(positions, colors, faces[keep_face])
-    scan_io.write_ply(os.path.join(out_dir, "room_without_furniture.ply"), room, room_colors, room_faces)
+    targets = [target for target in scan_io.roomplan_targets(args.scan_dir)
+               if target["id"] in replaced_target_ids]
+    fills, fill_reports = local_surface_patches(
+        positions, colors, targets, scan_io.roomplan_surfaces(args.scan_dir))
 
-    parts = [(room, room_colors, room_faces)] + fitted
-    offsets = np.cumsum([0] + [len(p[0]) for p in parts])
-    scan_io.write_ply(os.path.join(out_dir, "room_twin.ply"),
-                      np.concatenate([p[0] for p in parts]), np.concatenate([p[1] for p in parts]),
-                      np.concatenate([p[2] + o for p, o in zip(parts, offsets)]))
+    room_parts = [(room, room_colors, room_faces)] + fills
+    room_with_fills = merge_parts(room_parts)
+    scan_io.write_ply(os.path.join(out_dir, "room_without_furniture.ply"), *room_with_fills)
+
+    parts = room_parts + fitted
+    scan_io.write_ply(os.path.join(out_dir, "room_twin.ply"), *merge_parts(parts))
     with open(os.path.join(out_dir, "placement.json"), "w") as f:
-        json.dump(dict(floor_y=floor_y, objects=placement), f, indent=1)
+        json.dump(dict(floor_y=floor_y, objects=placement, local_surface_fills=fill_reports), f, indent=1)
     print(f"assemble: {len(fitted)} models placed; removed {np.count_nonzero(~keep_face)} of {len(faces)} scan triangles; "
-          f"room_twin.ply has {sum(len(p[2]) for p in parts)} triangles")
+          f"added {len(fills)} local RoomPlan fills; room_twin.ply has {sum(len(p[2]) for p in parts)} triangles")
+
+
+def local_surface_patches(positions, colors, targets, surfaces, margin=0.08):
+    """Small RoomPlan planes behind furniture that was actually replaced.
+
+    The detailed scan remains authoritative everywhere else.  A floor patch is
+    emitted only when the bottom of a target reaches a RoomPlan floor; a wall
+    patch only when its OBB reaches that wall.  Its colour comes from nearby
+    detailed-mesh samples outside the furniture box, so this is a local hole
+    repair rather than a clean RoomPlan reconstruction of the whole room.
+    """
+    parts, reports = [], []
+    defaults = {"floor": np.array([176, 160, 138], np.uint8),
+                "wall": np.array([226, 222, 214], np.uint8)}
+    for target in targets:
+        corners = scan_io.box_corners(target)
+        for surface in surfaces:
+            local = apply(surface["inverse"], corners)
+            maximum_gap = 0.18 if surface["kind"] == "floor" else 0.22
+            if np.min(np.abs(local[:, 2])) > maximum_gap:
+                continue
+
+            half = surface["dimensions"][:2] / 2
+            lo = np.maximum(local[:, :2].min(axis=0) - margin, -half)
+            hi = np.minimum(local[:, :2].max(axis=0) + margin, half)
+            if np.any(hi - lo < 0.05):
+                continue
+
+            # Use a single median colour sampled from the detailed surface
+            # surrounding the hole. Exclude the target itself so a red chair
+            # does not turn its repaired wall red.
+            scan_local = apply(surface["inverse"], positions)
+            sample_margin = 0.25
+            around = (np.abs(scan_local[:, 2]) < 0.08) \
+                & (scan_local[:, 0] >= lo[0] - sample_margin) \
+                & (scan_local[:, 0] <= hi[0] + sample_margin) \
+                & (scan_local[:, 1] >= lo[1] - sample_margin) \
+                & (scan_local[:, 1] <= hi[1] + sample_margin)
+            outside_hole = (scan_local[:, 0] < lo[0]) | (scan_local[:, 0] > hi[0]) \
+                | (scan_local[:, 1] < lo[1]) | (scan_local[:, 1] > hi[1])
+            outside_object = ~scan_io.points_in_target(positions, target, margin=0.025)
+            samples = colors[around & outside_hole & outside_object]
+            colour = np.median(samples, axis=0).astype(np.uint8) if len(samples) >= 12 \
+                else defaults[surface["kind"]]
+
+            patch_local = np.array([
+                [lo[0], lo[1], 0], [hi[0], lo[1], 0],
+                [hi[0], hi[1], 0], [lo[0], hi[1], 0],
+            ], np.float64)
+            patch = apply(surface["transform"], patch_local)
+            # Both windings make the repair visible from either side without
+            # assuming how a downstream PLY viewer configures face culling.
+            patch_faces = np.array([[0, 1, 2], [0, 2, 3],
+                                    [2, 1, 0], [3, 2, 0]], np.int64)
+            patch_colors = np.tile(colour, (4, 1))
+            parts.append((patch, patch_colors, patch_faces))
+            reports.append(dict(
+                roomplan_target=int(target["id"]), surface=surface["kind"],
+                width_m=round(float(hi[0] - lo[0]), 4),
+                height_m=round(float(hi[1] - lo[1]), 4),
+                sampled_vertices=int(len(samples)), colour=colour.tolist()))
+    return parts, reports
+
+
+def merge_parts(parts):
+    offsets = np.cumsum([0] + [len(part[0]) for part in parts])
+    return (np.concatenate([part[0] for part in parts]),
+            np.concatenate([part[1] for part in parts]),
+            np.concatenate([part[2] + offset for part, offset in zip(parts, offsets)]))
 
 
 def sample_surface(positions, faces, count=200_000, seed=0):

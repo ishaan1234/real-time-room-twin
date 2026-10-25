@@ -106,7 +106,16 @@ struct ModelReveal: View {
             .frame(maxWidth: .infinity)
             .contentShape(Rectangle())
             .gesture(swipeUp)
-            if let mac = sender.knownMac { preloadButton(mac) }
+            if let mac = sender.knownMac {
+                if sender.canPreload(on: mac) {
+                    preloadButton(mac)
+                } else {
+                    // An older Viewer would show a preload at once and never say it's ready.
+                    Text("Update RoomTwin Viewer on \(mac) to pre-load")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+            }
             if savedName == nil { saveButton }
             HStack(spacing: 12) {
                 Button("Close", systemImage: "xmark", action: onClose)

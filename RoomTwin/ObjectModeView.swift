@@ -6,11 +6,12 @@ struct ObjectModeView: View {
     @ObservedObject var capture: ObjectCapture
     let takePhoto: () -> Void
     @State private var editingServer = false
+    @EnvironmentObject private var account: Account
 
     var body: some View {
         VStack(spacing: 12) {
             if let photo = capture.photo {
-                PhotoSelection(photo: photo, overlay: overlay, tap: capture.tap, onTap: capture.select)
+                PhotoSelection(photo: photo, overlay: overlay, taps: capture.taps, onTap: capture.select)
             } else {
                 Spacer()
             }
@@ -59,15 +60,24 @@ struct ObjectModeView: View {
         } else if capture.step == .done {
             Text("Saved in Files › RoomTwin › Objects. Tap another object to make another.").capsuleLabel()
         } else if capture.masks.isEmpty {
-            Text("Tap the object you want in 3D").capsuleLabel()
-        } else if capture.masks.count > 1 {
-            Picker("Mask", selection: $capture.chosenMask) {
-                ForEach(Array(["Large", "Medium", "Small"].prefix(capture.masks.count).enumerated()), id: \.offset) {
-                    Text($0.element).tag(Int?.some($0.offset))
+            Text(capture.taps.isEmpty
+                 ? "Tap the object you want in 3D"
+                 : "Using \(capture.taps.count) point\(capture.taps.count == 1 ? "" : "s") on one object")
+                .capsuleLabel()
+        } else {
+            VStack(spacing: 8) {
+                Text("\(capture.taps.count) point\(capture.taps.count == 1 ? "" : "s") · Tap another part of the same object to refine")
+                    .capsuleLabel()
+                if capture.masks.count > 1 {
+                    Picker("Mask", selection: $capture.chosenMask) {
+                        ForEach(Array(["Large", "Medium", "Small"].prefix(capture.masks.count).enumerated()), id: \.offset) {
+                            Text($0.element).tag(Int?.some($0.offset))
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 280)
                 }
             }
-            .pickerStyle(.segmented)
-            .frame(maxWidth: 280)
         }
     }
 
@@ -97,12 +107,17 @@ struct ObjectModeView: View {
                 Button("Retake", systemImage: "camera", action: capture.retake)
                     .buttonStyle(.bordered)
                     .tint(.white)
+                if !capture.taps.isEmpty {
+                    Button("Clear", systemImage: "xmark.circle", action: capture.clearPoints)
+                        .buttonStyle(.bordered)
+                        .tint(.white)
+                }
                 if capture.step == .done, capture.modelURL != nil {
                     Button("View 3D", systemImage: "cube") { capture.revealURL = capture.modelURL }
                         .buttonStyle(.bordered)
                         .tint(.white)
                 }
-                Button("Generate 3D", systemImage: "wand.and.stars", action: capture.generate)
+                Button("Generate 3D", systemImage: "wand.and.stars") { capture.generate(account: account) }
                     .buttonStyle(.borderedProminent)
                     .disabled(capture.step != .choosing || capture.chosenMask == nil)
             }
@@ -110,11 +125,11 @@ struct ObjectModeView: View {
     }
 }
 
-/// The photo with the chosen mask over it. Taps are reported as 0...1 across the photo.
+/// The photo with the chosen mask over it. Points are reported as 0...1 across the photo.
 private struct PhotoSelection: View {
     let photo: UIImage
     let overlay: UIImage?
-    let tap: CGPoint?
+    let taps: [CGPoint]
     let onTap: (CGPoint) -> Void
 
     var body: some View {
@@ -126,12 +141,17 @@ private struct PhotoSelection: View {
                 if let overlay {
                     Image(uiImage: overlay).resizable()
                 }
-                if let tap {
-                    Circle()
-                        .fill(.white)
-                        .stroke(.black.opacity(0.5), lineWidth: 1)
-                        .frame(width: 12, height: 12)
-                        .position(x: tap.x * size.width, y: tap.y * size.height)
+                ForEach(Array(taps.enumerated()), id: \.offset) { index, tap in
+                    ZStack {
+                        Circle()
+                            .fill(.blue)
+                            .stroke(.white, lineWidth: 2)
+                        Text("\(index + 1)")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.white)
+                    }
+                    .frame(width: 22, height: 22)
+                    .position(x: tap.x * size.width, y: tap.y * size.height)
                 }
             }
             .frame(width: size.width, height: size.height)

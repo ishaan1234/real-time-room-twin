@@ -39,11 +39,13 @@ final class Account: ObservableObject {
         let modelPath: String
         let plyPath: String
         let jsonPath: String
+        let editsPath: String?
         let createdAt: String
 
         enum CodingKeys: String, CodingKey {
             case id, name
-            case modelPath = "model_path", plyPath = "ply_path", jsonPath = "json_path", createdAt = "created_at"
+            case modelPath = "model_path", plyPath = "ply_path", jsonPath = "json_path"
+            case editsPath = "edits_path", createdAt = "created_at"
         }
     }
 
@@ -52,6 +54,7 @@ final class Account: ObservableObject {
     }
 
     @Published private(set) var session: Session?
+    @Published private(set) var roomDriveFolderName: String?
 
     static let config: (url: URL, key: String)? = {
         guard let file = Bundle.main.url(forResource: "supabase", withExtension: "json"),
@@ -65,9 +68,16 @@ final class Account: ObservableObject {
         .appendingPathComponent("MyObjects")
     private static let roomCache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("SavedRooms")
+    private static let roomDriveBookmarkKey = "room-drive-folder"
+    private static let roomDrivePrefix = "drive:"
+    private static let roomDriveDirectory = "RoomTwin"
 
     init() {
         session = Keychain.read(Self.sessionKey).flatMap { try? JSONDecoder().decode(Session.self, from: $0) }
+        if let bookmark = UserDefaults.standard.data(forKey: Self.roomDriveBookmarkKey),
+           let folder = try? Self.resolveRoomDriveFolder(bookmark) {
+            roomDriveFolderName = folder.lastPathComponent
+        }
     }
 
     // MARK: Signing in
@@ -99,6 +109,30 @@ final class Account: ObservableObject {
         if let token {
             Task { _ = try? await call("auth/v1/logout", method: "POST", bearer: token) }
         }
+    }
+
+    // MARK: Google Drive room folder
+
+    /// Stores durable permission to a folder chosen from the iOS Files
+    /// picker. Choosing a folder under Google Drive lets RoomTwin write whole
+    /// room files there without shipping a Google API secret in the app.
+    func connectRoomDriveFolder(_ folder: URL) throws {
+        guard folder.startAccessingSecurityScopedResource() else {
+            throw Failure(errorDescription: "RoomTwin could not access that folder. Choose it again from Google Drive in Files.")
+        }
+        defer { folder.stopAccessingSecurityScopedResource() }
+        let root = folder.appendingPathComponent(Self.roomDriveDirectory, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let bookmark = try folder.bookmarkData(options: .minimalBookmark,
+                                               includingResourceValuesForKeys: nil,
+                                               relativeTo: nil)
+        UserDefaults.standard.set(bookmark, forKey: Self.roomDriveBookmarkKey)
+        roomDriveFolderName = folder.lastPathComponent
+    }
+
+    func disconnectRoomDriveFolder() {
+        UserDefaults.standard.removeObject(forKey: Self.roomDriveBookmarkKey)
+        roomDriveFolderName = nil
     }
 
     private static func email(for username: String) throws -> String {
@@ -188,45 +222,124 @@ final class Account: ObservableObject {
     // MARK: Saved room layouts
 
     func roomLayouts() async throws -> [SavedRoomLayout] {
-        let data = try await call("rest/v1/room_layouts?select=id,name,model_path,ply_path,json_path,created_at&order=created_at.desc")
+        let data = try await call("rest/v1/room_layouts?select=id,name,model_path,ply_path,json_path,edits_path,created_at&order=created_at.desc")
         return try JSONDecoder().decode([SavedRoomLayout].self, from: data)
     }
 
-    /// Uploads the edited room model together with the raw PLY and RoomPlan's
-    /// semantic JSON, then creates the row owned by the signed-in user.
-    func saveRoomLayout(model: URL, ply: URL, json: URL, name: String) async throws {
+    /// Writes complete room files to the user's selected Google Drive folder,
+    /// then stores their relative paths and ownership record in Supabase.
+    func saveRoomLayout(model: URL, ply: URL, json: URL, edits: URL, name: String) async throws {
         guard let user = session?.userID else { throw Failure(errorDescription: "Log in first.") }
+        let bookmark = try roomDriveBookmark()
         let folder = "\(user)/\(UUID().uuidString.lowercased())"
-        let modelPath = "\(folder)/room.usdz"
-        let plyPath = "\(folder)/room.ply"
-        let jsonPath = "\(folder)/room.json"
-        try await call("storage/v1/object/room-layouts/\(modelPath)", method: "POST",
-                       body: try Data(contentsOf: model), contentType: "model/vnd.usdz+zip")
-        try await call("storage/v1/object/room-layouts/\(plyPath)", method: "POST",
-                       body: try Data(contentsOf: ply), contentType: "application/octet-stream")
-        try await call("storage/v1/object/room-layouts/\(jsonPath)", method: "POST",
-                       body: try Data(contentsOf: json), contentType: "application/json")
-        try await call("rest/v1/room_layouts", method: "POST",
-                       json: ["name": name, "model_path": modelPath, "ply_path": plyPath, "json_path": jsonPath])
+        do {
+            try await Task.detached(priority: .utility) {
+                try Self.withRoomDriveFolder(bookmark) { root in
+                    let destination = root.appendingPathComponent(folder, isDirectory: true)
+                    try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+                    try Self.copyRoomFile(model, to: destination.appendingPathComponent("room.usdz"))
+                    try Self.copyRoomFile(ply, to: destination.appendingPathComponent("room.ply"))
+                    try Self.copyRoomFile(json, to: destination.appendingPathComponent("room.json"))
+                    try Self.copyRoomFile(edits, to: destination.appendingPathComponent("room-edits.json"))
+                }
+            }.value
+            try await call("rest/v1/room_layouts", method: "POST",
+                           json: ["name": name,
+                                  "model_path": Self.roomDrivePrefix + "\(folder)/room.usdz",
+                                  "ply_path": Self.roomDrivePrefix + "\(folder)/room.ply",
+                                  "json_path": Self.roomDrivePrefix + "\(folder)/room.json",
+                                  "edits_path": Self.roomDrivePrefix + "\(folder)/room-edits.json"])
+        } catch {
+            try? await Task.detached(priority: .utility) {
+                try Self.withRoomDriveFolder(bookmark) { root in
+                    try? FileManager.default.removeItem(at: root.appendingPathComponent(folder))
+                }
+            }.value
+            throw error
+        }
     }
 
     /// The room's USDZ and RoomPlan JSON, downloaded once and then kept on the phone.
-    func roomFiles(for layout: SavedRoomLayout) async throws -> (model: URL, json: URL) {
+    func roomFiles(for layout: SavedRoomLayout) async throws -> (model: URL, json: URL, edits: URL?) {
         let folder = Self.roomCache.appendingPathComponent(layout.id.uuidString)
         let model = folder.appendingPathComponent("room.usdz"), json = folder.appendingPathComponent("room.json")
+        let edits = layout.editsPath.map { _ in folder.appendingPathComponent("room-edits.json") }
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        for (file, path) in [(model, layout.modelPath), (json, layout.jsonPath)]
-        where !FileManager.default.fileExists(atPath: file.path) {
-            try await call("storage/v1/object/authenticated/room-layouts/\(path)").write(to: file, options: .atomic)
+        var downloads = [(model, layout.modelPath), (json, layout.jsonPath)]
+        if let edits, let path = layout.editsPath { downloads.append((edits, path)) }
+        for (file, path) in downloads where !FileManager.default.fileExists(atPath: file.path) {
+            if let relative = Self.roomDriveRelativePath(path) {
+                let bookmark = try roomDriveBookmark()
+                try await Task.detached(priority: .utility) {
+                    try Self.withRoomDriveFolder(bookmark) { root in
+                        try Self.copyRoomFile(root.appendingPathComponent(relative), to: file)
+                    }
+                }.value
+            } else {
+                // Rooms saved by older builds remain readable.
+                let data = try await call("storage/v1/object/authenticated/room-layouts/\(path)")
+                try data.write(to: file, options: .atomic)
+            }
         }
-        return (model, json)
+        return (model, json, edits)
     }
 
     func delete(_ layout: SavedRoomLayout) async throws {
+        if let relative = Self.roomDriveRelativePath(layout.modelPath) {
+            let bookmark = try roomDriveBookmark()
+            let folder = URL(fileURLWithPath: relative).deletingLastPathComponent().path
+            try await Task.detached(priority: .utility) {
+                try Self.withRoomDriveFolder(bookmark) { root in
+                    try FileManager.default.removeItem(at: root.appendingPathComponent(folder))
+                }
+            }.value
+        } else {
+            let objects = [layout.modelPath, layout.plyPath, layout.jsonPath]
+                + (layout.editsPath.map { [$0] } ?? [])
+            try await call("storage/v1/object/room-layouts", method: "DELETE",
+                           json: ["prefixes": objects])
+        }
         try await call("rest/v1/room_layouts?id=eq.\(layout.id.uuidString.lowercased())", method: "DELETE")
-        try await call("storage/v1/object/room-layouts", method: "DELETE",
-                       json: ["prefixes": [layout.modelPath, layout.plyPath, layout.jsonPath]])
         try? FileManager.default.removeItem(at: Self.roomCache.appendingPathComponent(layout.id.uuidString))
+    }
+
+    private func roomDriveBookmark() throws -> Data {
+        guard let bookmark = UserDefaults.standard.data(forKey: Self.roomDriveBookmarkKey) else {
+            throw Failure(errorDescription: "Choose a Google Drive folder from the account menu before saving a room.")
+        }
+        return bookmark
+    }
+
+    private nonisolated static func resolveRoomDriveFolder(_ bookmark: Data) throws -> URL {
+        var stale = false
+        let folder = try URL(resolvingBookmarkData: bookmark, options: .withoutUI,
+                             relativeTo: nil, bookmarkDataIsStale: &stale)
+        guard !stale else {
+            throw Failure(errorDescription: "Google Drive folder permission expired. Choose the folder again.")
+        }
+        return folder
+    }
+
+    private nonisolated static func withRoomDriveFolder<T>(_ bookmark: Data, body: (URL) throws -> T) throws -> T {
+        let selected = try resolveRoomDriveFolder(bookmark)
+        guard selected.startAccessingSecurityScopedResource() else {
+            throw Failure(errorDescription: "Google Drive is unavailable. Open Drive in Files, then choose the folder again.")
+        }
+        defer { selected.stopAccessingSecurityScopedResource() }
+        let root = selected.appendingPathComponent(roomDriveDirectory, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return try body(root)
+    }
+
+    private nonisolated static func roomDriveRelativePath(_ path: String) -> String? {
+        path.hasPrefix(roomDrivePrefix) ? String(path.dropFirst(roomDrivePrefix.count)) : nil
+    }
+
+    private nonisolated static func copyRoomFile(_ source: URL, to destination: URL) throws {
+        let files = FileManager.default
+        try files.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if files.fileExists(atPath: destination.path) { try files.removeItem(at: destination) }
+        try files.copyItem(at: source, to: destination)
     }
 
     private static func smallJPEG(_ image: UIImage) -> Data? {
