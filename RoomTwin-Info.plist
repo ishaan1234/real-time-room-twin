@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>RoomTwin sends photos to the object server on your Mac to turn them into 3D models, and sends finished models to RoomTwin Viewer.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_roomtwin-model._tcp</string>
+		<string>_roomtwin-model._udp</string>
+	</array>
+</dict>
+</plist>

@@ -1,0 +1,9 @@
+build/
+xcuserdata/
+*.xcuserstate
+.DS_Store
+scans/
+.env.local
+RoomTwin/supabase.json
+__pycache__/
+*.pyc
