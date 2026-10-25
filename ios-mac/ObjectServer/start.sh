@@ -28,8 +28,8 @@ FAL_LOG=${FAL_LOG:-/tmp/roomtwin-fal-server.log}
 
 # Read FALKEY as data rather than sourcing arbitrary shell code.
 FAL_VALUE=${FALKEY:-}
-if [ -z "$FAL_VALUE" ] && [ -f "$ROOT/.env.local" ]; then
-    FAL_VALUE=$(awk -F= '$1 == "FALKEY" { sub(/^[^=]*=/, ""); print; exit }' "$ROOT/.env.local")
+if [ -z "$FAL_VALUE" ] && [ -f "$ROOT/../.env.local" ]; then
+    FAL_VALUE=$(awk -F= '$1 == "FALKEY" { sub(/^[^=]*=/, ""); print; exit }' "$ROOT/../.env.local")
     FAL_VALUE=${FAL_VALUE#\"}; FAL_VALUE=${FAL_VALUE%\"}
     FAL_VALUE=${FAL_VALUE#\'}; FAL_VALUE=${FAL_VALUE%\'}
 fi

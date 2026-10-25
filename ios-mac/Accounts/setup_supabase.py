@@ -31,7 +31,7 @@ import urllib.request
 import uuid
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ENV = os.path.join(ROOT, ".env.local")
+ENV = os.path.join(os.path.dirname(ROOT), ".env.local")  # at the top of the repo
 
 
 def read_env():

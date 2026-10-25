@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en" class="h-full">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RoomTwin</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop stop-color='%238b7bff'/><stop offset='1' stop-color='%2338bdf8'/></linearGradient></defs><rect width='32' height='32' rx='8' fill='url(%23g)'/><path d='M8 15l8-7 8 7v9H8z' fill='none' stroke='white' stroke-width='2.4' stroke-linejoin='round'/></svg>" />
+  </head>
+  <body class="h-full overflow-hidden bg-ink font-sans text-zinc-100 antialiased">
+    <!-- Backdrop: slow aurora behind the transparent 3D view. -->
+    <div class="pointer-events-none fixed inset-0 overflow-hidden" aria-hidden="true">
+      <div class="absolute -top-1/3 -left-1/4 size-[70vmax] animate-drift rounded-full bg-[radial-gradient(circle,rgb(124_92_255/0.22),transparent_60%)] blur-3xl"></div>
+      <div class="absolute -right-1/4 -bottom-1/3 size-[65vmax] animate-drift rounded-full bg-[radial-gradient(circle,rgb(56_189_248/0.16),transparent_60%)] blur-3xl [animation-delay:-11s]"></div>
+      <div class="absolute top-1/4 left-1/3 size-[40vmax] animate-drift rounded-full bg-[radial-gradient(circle,rgb(236_72_153/0.08),transparent_60%)] blur-3xl [animation-delay:-5s]"></div>
+      <div class="absolute inset-0 bg-[radial-gradient(rgb(255_255_255/0.07)_1px,transparent_1px)] [background-size:28px_28px] [mask-image:radial-gradient(ellipse_at_center,black_20%,transparent_75%)]"></div>
+    </div>
+
+    <main class="relative h-full">
+      <div id="stage" class="absolute inset-0"></div>
+
+      <div id="empty" class="pointer-events-none absolute inset-0 flex items-center justify-center p-8 md:pl-[24rem]">
+        <div class="flex max-w-xl animate-rise flex-col items-center text-center">
+          <div class="relative mb-8">
+            <div class="absolute inset-0 rounded-[2rem] bg-gradient-to-br from-[#8b7bff] to-[#38bdf8] opacity-60 blur-2xl"></div>
+            <div class="relative flex size-24 items-center justify-center rounded-[2rem] border border-white/20 bg-gradient-to-br from-[#7c5cff] to-[#2563eb] shadow-2xl">
+              <span data-icon="scan" class="size-11 text-white"></span>
+            </div>
+          </div>
+          <h1 class="font-display text-5xl leading-[1.05] font-semibold tracking-tight md:text-6xl">
+            <span class="gradient-text">Your room,</span><br /><span class="text-white">digitally twinned.</span>
+          </h1>
+          <p class="mt-5 max-w-md text-base leading-relaxed text-zinc-400">
+            Scan it on the iPhone with LiDAR. Furnish it here with your voice, your hands or your mouse. Then step inside it in VR.
+          </p>
+          <div class="mt-7 flex flex-wrap justify-center gap-2">
+            <span class="chip"><span data-icon="scan" class="text-[#a99cff]"></span>LiDAR + RoomPlan</span>
+            <span class="chip"><span data-icon="mic" class="text-[#7dd3fc]"></span>Voice agent</span>
+            <span class="chip"><span data-icon="hand" class="text-pink-300"></span>Hand tracking</span>
+            <span class="chip"><span data-icon="wand" class="text-amber-300"></span>Photo → 3D</span>
+            <span class="chip"><span data-icon="vr" class="text-emerald-300"></span>WebXR</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Brand and room name -->
+      <div class="glass absolute top-4 left-4 z-20 flex h-14 items-center gap-3 rounded-2xl pr-4 pl-2 max-md:right-4">
+        <div class="relative flex size-10 items-center justify-center rounded-xl bg-gradient-to-br from-[#7c5cff] to-[#2563eb] shadow-[0_6px_20px_-4px_rgb(124_92_255/0.8)]">
+          <span data-icon="house" class="size-5 text-white"></span>
+        </div>
+        <div class="min-w-0 leading-tight">
+          <div class="font-display text-[15px] font-semibold tracking-tight">RoomTwin</div>
+          <div class="flex items-center gap-1.5 text-xs text-zinc-400">
+            <span id="room-dot" class="size-1.5 rounded-full bg-zinc-600"></span>
+            <span id="room-name" class="max-w-56 truncate">No room open</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Toolbar -->
+      <div class="absolute top-4 right-4 z-20 flex items-center gap-2 max-md:top-20">
+        <div class="glass flex h-14 items-center gap-1 rounded-2xl px-2">
+          <button id="undo" class="btn btn-icon border-transparent bg-transparent" title="Undo (Ctrl+Z)" disabled><span data-icon="undo"></span></button>
+          <button id="redo" class="btn btn-icon border-transparent bg-transparent" title="Redo (Ctrl+Shift+Z)" disabled><span data-icon="redo"></span></button>
+          <div class="mx-1 h-6 w-px bg-white/10"></div>
+          <div id="mode" class="segmented text-sm">
+            <button data-mode="orbit" class="seg" title="Dollhouse view (Tab)"><span data-icon="orbit"></span>Orbit</button>
+            <button data-mode="walk" class="seg" title="Walk inside (Tab)"><span data-icon="walk"></span>Walk</button>
+          </div>
+          <div class="mx-1 h-6 w-px bg-white/10"></div>
+          <button id="hands" class="btn border-transparent bg-transparent" title="Move furniture with your hand in front of the webcam: point, pinch to grab, open to let go"><span data-icon="hand"></span><span>Hands</span></button>
+          <button id="history" class="btn btn-icon border-transparent bg-transparent" title="Voice history"><span data-icon="history"></span></button>
+          <button id="settings" class="btn btn-icon border-transparent bg-transparent" title="Settings"><span data-icon="settings"></span></button>
+          <button id="user" class="btn hidden border-transparent bg-transparent"></button>
+        </div>
+        <button id="vr" class="btn btn-primary h-14 rounded-2xl px-5 text-[15px]" disabled><span data-icon="vr" class="size-5"></span><span>Enter VR</span></button>
+      </div>
+
+      <!-- Sidebar -->
+      <aside class="glass absolute top-22 bottom-4 left-4 z-10 flex w-[22rem] flex-col rounded-3xl max-md:hidden">
+        <nav id="tabs" class="m-2 flex gap-1 rounded-2xl bg-black/30 p-1">
+          <button data-tab="rooms" class="tab"><span data-icon="house"></span>Rooms</button>
+          <button data-tab="add" class="tab"><span data-icon="plus"></span>Add</button>
+          <button data-tab="walls" class="tab"><span data-icon="paint"></span>Surfaces</button>
+          <button data-tab="layout" class="tab"><span data-icon="layers"></span>Layout</button>
+        </nav>
+        <div id="panel" class="min-h-0 flex-1 overflow-y-auto px-4 pt-2 pb-4"></div>
+      </aside>
+
+      <div id="inspector" class="glass absolute top-22 right-4 z-10 hidden max-h-[calc(100%-7rem)] w-72 animate-rise overflow-y-auto rounded-3xl p-4 text-sm max-md:top-36"></div>
+      <div id="stats" class="pointer-events-none absolute top-24 left-[24.5rem] z-10 hidden flex-col gap-1.5 max-md:hidden"></div>
+      <div id="hand-preview" class="absolute bottom-28 left-[24.5rem] z-10 hidden h-32 w-48 overflow-hidden rounded-2xl border border-white/15 bg-black shadow-2xl ring-1 ring-[#8b7bff]/30 max-md:left-4"></div>
+      <div id="vr-debug" class="absolute top-22 left-[24.5rem] z-10 hidden max-w-md rounded-2xl bg-black/70 p-3 font-mono text-xs text-lime-300"></div>
+
+      <!-- Voice dock, captions and notes -->
+      <div class="pointer-events-none absolute inset-x-0 bottom-4 z-20 flex flex-col items-center gap-3 px-4 md:pl-[24rem]">
+        <div id="caption" class="glass pointer-events-auto hidden max-w-xl animate-rise rounded-2xl px-5 py-3 text-center text-[15px] leading-snug"></div>
+        <div id="toast" class="glass pointer-events-auto hidden max-w-xl animate-rise cursor-pointer items-center gap-2.5 rounded-2xl px-4 py-2.5 text-sm"></div>
+        <div class="flex items-center gap-3">
+          <div id="help" class="glass pointer-events-auto hidden items-center gap-3 rounded-full px-4 py-2 text-[11px] text-zinc-400 lg:flex"></div>
+          <button id="talk" class="group pointer-events-auto relative flex h-14 items-center gap-3 rounded-full py-2 pr-6 pl-2 font-display text-[15px] font-semibold text-white transition active:scale-95" data-state="off">
+            <span class="talk-rings pointer-events-none absolute top-1/2 left-7 hidden size-10 -translate-1/2" aria-hidden="true">
+              <span class="absolute inset-0 animate-ring rounded-full border-2 border-[#8b7bff]"></span>
+              <span class="absolute inset-0 animate-ring rounded-full border-2 border-[#38bdf8] [animation-delay:0.6s]"></span>
+            </span>
+            <span class="absolute inset-0 -z-10 rounded-full bg-gradient-to-r from-[#7c5cff] via-[#5b6cff] to-[#22a6f2] shadow-[0_12px_40px_-8px_rgb(124_92_255/0.9),inset_0_1px_0_rgb(255_255_255/0.3)] transition group-hover:brightness-110 group-data-[state=listening]:from-rose-500 group-data-[state=listening]:via-fuchsia-500 group-data-[state=listening]:to-violet-500"></span>
+            <span class="talk-orb relative flex size-10 items-center justify-center rounded-full bg-white/20 shadow-inner"></span>
+            <span class="talk-label">Talk to your room</span>
+          </button>
+        </div>
+        <div id="credits" class="max-w-2xl text-center text-[10px] text-zinc-600"></div>
+      </div>
+    </main>
+
+    <dialog id="settings-dialog" class="glass m-auto w-[min(32rem,calc(100%-2rem))] rounded-3xl p-0 text-zinc-100"></dialog>
+    <dialog id="photo-dialog" class="glass m-auto w-[min(46rem,calc(100%-2rem))] rounded-3xl p-0 text-zinc-100"></dialog>
+    <dialog id="history-dialog" class="glass m-auto w-[min(34rem,calc(100%-2rem))] rounded-3xl p-0 text-zinc-100"></dialog>
+    <input id="file-input" type="file" class="hidden" />
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

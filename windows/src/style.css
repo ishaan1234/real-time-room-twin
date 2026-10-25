@@ -1,0 +1,167 @@
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/space-grotesk";
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Space Grotesk Variable", "Inter Variable", ui-sans-serif, sans-serif;
+  --color-ink: #06060a;
+  --color-accent: #8b7bff;
+  --color-accent-2: #38bdf8;
+  --animate-drift: drift 22s ease-in-out infinite alternate;
+  --animate-rise: rise 0.35s cubic-bezier(0.2, 0.9, 0.3, 1.2) both;
+  --animate-ring: ring 1.8s cubic-bezier(0.2, 0.6, 0.4, 1) infinite;
+  --animate-shine: shine 6s linear infinite;
+}
+
+@keyframes drift {
+  from { transform: translate3d(-6%, -4%, 0) scale(1); }
+  to { transform: translate3d(6%, 5%, 0) scale(1.15); }
+}
+@keyframes rise {
+  from { opacity: 0; transform: translateY(10px) scale(0.97); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes ring {
+  from { opacity: 0.7; transform: scale(1); }
+  to { opacity: 0; transform: scale(1.9); }
+}
+@keyframes shine {
+  to { background-position: 200% center; }
+}
+@keyframes bars {
+  0%, 100% { transform: scaleY(0.25); }
+  50% { transform: scaleY(1); }
+}
+
+@layer base {
+  ::selection { background: rgb(139 123 255 / 0.45); }
+  * { scrollbar-width: thin; scrollbar-color: rgb(255 255 255 / 0.12) transparent; }
+  .icon { width: 1.1em; height: 1.1em; flex-shrink: 0; }
+  dialog::backdrop { background: rgb(4 4 8 / 0.6); backdrop-filter: blur(6px); }
+  dialog[open] { animation: rise 0.3s cubic-bezier(0.2, 0.9, 0.3, 1.1) both; }
+  input[type="checkbox"] {
+    appearance: none;
+    position: relative;
+    width: 2.1rem;
+    height: 1.2rem;
+    flex-shrink: 0;
+    cursor: pointer;
+    border-radius: 999px;
+    background: rgb(255 255 255 / 0.1);
+    box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.08);
+    transition: background 0.2s;
+  }
+  input[type="checkbox"]::after {
+    content: "";
+    position: absolute;
+    top: 0.15rem;
+    left: 0.15rem;
+    width: 0.9rem;
+    height: 0.9rem;
+    border-radius: 999px;
+    background: white;
+    box-shadow: 0 1px 3px rgb(0 0 0 / 0.4);
+    transition: transform 0.25s cubic-bezier(0.3, 1.4, 0.5, 1);
+  }
+  input[type="checkbox"]:checked { background: linear-gradient(90deg, var(--color-accent), var(--color-accent-2)); }
+  input[type="checkbox"]:checked::after { transform: translateX(0.9rem); }
+  input[type="range"] {
+    appearance: none;
+    height: 1.25rem;
+    background: transparent;
+    cursor: pointer;
+  }
+  input[type="range"]::-webkit-slider-runnable-track {
+    height: 4px;
+    border-radius: 999px;
+    background: linear-gradient(90deg, var(--color-accent), var(--color-accent-2));
+    opacity: 0.85;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    appearance: none;
+    margin-top: -6px;
+    width: 16px;
+    height: 16px;
+    border-radius: 999px;
+    background: white;
+    box-shadow: 0 0 0 4px rgb(139 123 255 / 0.25), 0 2px 6px rgb(0 0 0 / 0.5);
+  }
+}
+
+@layer components {
+  /* Frosted panels floating over the room. */
+  .glass {
+    @apply border border-white/[0.08] bg-[#0d0d16]/70 shadow-[0_20px_60px_-15px_rgb(0_0_0/0.8),inset_0_1px_0_rgb(255_255_255/0.06)] backdrop-blur-2xl backdrop-saturate-150;
+  }
+  .gradient-text {
+    @apply bg-gradient-to-r from-white via-[#c7bfff] to-[#7dd3fc] bg-[length:200%_auto] bg-clip-text text-transparent animate-shine;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-xl border border-white/[0.07] bg-white/[0.06] px-3 py-2 text-sm font-medium text-zinc-200 transition duration-200 hover:border-white/15 hover:bg-white/[0.11] hover:text-white active:scale-[0.97] disabled:pointer-events-none disabled:opacity-35;
+  }
+  .btn-primary {
+    @apply border-transparent bg-gradient-to-r from-[#7c5cff] to-[#3b82f6] text-white shadow-[0_8px_24px_-8px_rgb(124_92_255/0.8),inset_0_1px_0_rgb(255_255_255/0.25)] hover:border-transparent hover:from-[#8d70ff] hover:to-[#4f8ff7] hover:shadow-[0_10px_30px_-6px_rgb(124_92_255/0.9),inset_0_1px_0_rgb(255_255_255/0.3)];
+  }
+  .btn-danger {
+    @apply border-red-400/20 bg-red-500/15 text-red-200 hover:border-red-400/40 hover:bg-red-500/25 hover:text-white;
+  }
+  .btn-icon {
+    @apply size-9 px-0;
+  }
+  .seg {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-[0.6rem] px-3 py-1.5 text-zinc-400 transition duration-200 hover:text-zinc-100;
+  }
+  .seg[aria-pressed="true"] {
+    @apply bg-white/[0.12] text-white shadow-[inset_0_1px_0_rgb(255_255_255/0.1),0_2px_8px_rgb(0_0_0/0.3)];
+  }
+  .segmented {
+    @apply flex rounded-xl border border-white/[0.06] bg-black/30 p-1;
+  }
+  .tab {
+    @apply flex flex-1 flex-col items-center gap-1 rounded-xl py-2 text-[11px] font-medium text-zinc-500 transition duration-200 hover:bg-white/[0.04] hover:text-zinc-200;
+  }
+  .tab .icon { @apply size-[18px]; }
+  .tab[aria-selected="true"] {
+    @apply bg-gradient-to-b from-white/[0.1] to-white/[0.03] text-white shadow-[inset_0_1px_0_rgb(255_255_255/0.08)];
+  }
+  .tab[aria-selected="true"] .icon { @apply text-[#a99cff]; }
+  .field {
+    @apply w-full rounded-xl border border-white/[0.08] bg-black/35 px-3 py-2.5 text-sm text-white outline-none transition placeholder:text-zinc-600 focus:border-[#8b7bff]/70 focus:bg-black/50 focus:ring-4 focus:ring-[#8b7bff]/15;
+  }
+  .label {
+    @apply mb-1.5 block text-[11px] font-medium tracking-wide text-zinc-400;
+  }
+  .heading {
+    @apply mt-6 mb-3 flex items-center gap-2 font-display text-[11px] font-semibold tracking-[0.14em] text-zinc-500 uppercase first:mt-1;
+  }
+  .heading::after {
+    content: "";
+    @apply h-px flex-1 bg-gradient-to-r from-white/10 to-transparent;
+  }
+  .note {
+    @apply text-xs leading-relaxed text-zinc-500;
+  }
+  .card {
+    @apply flex w-full flex-col overflow-hidden rounded-xl border border-white/[0.07] bg-white/[0.03] text-left text-xs transition duration-300 hover:-translate-y-0.5 hover:border-[#8b7bff]/50 hover:bg-white/[0.07] hover:shadow-[0_12px_30px_-12px_rgb(124_92_255/0.6)];
+  }
+  .card img, .card .card-art {
+    @apply transition duration-500 group-hover:scale-[1.06];
+  }
+  .tile {
+    @apply flex flex-col items-start gap-2 rounded-2xl border border-white/[0.07] bg-gradient-to-br from-white/[0.06] to-white/[0.01] p-3 text-left text-sm font-medium text-zinc-200 transition duration-300 hover:-translate-y-0.5 hover:border-white/15 hover:from-white/[0.1] disabled:opacity-40;
+  }
+  .tile-icon {
+    @apply flex size-8 items-center justify-center rounded-lg bg-gradient-to-br text-white shadow-lg;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded-full border border-white/[0.08] bg-black/40 px-2.5 py-1 text-[11px] font-medium text-zinc-300 backdrop-blur-xl;
+  }
+  .kbd {
+    @apply rounded-md border border-white/10 bg-white/[0.06] px-1.5 py-px font-sans text-[10px] font-semibold text-zinc-300 shadow-[inset_0_-1px_0_rgb(255_255_255/0.06)];
+  }
+  .bars span {
+    @apply block w-[3px] origin-center rounded-full bg-white;
+    animation: bars 0.9s ease-in-out infinite;
+  }
+}

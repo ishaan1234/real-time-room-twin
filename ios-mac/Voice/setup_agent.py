@@ -27,7 +27,7 @@ import urllib.error
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ENV = os.path.join(ROOT, ".env.local")
+ENV = os.path.join(os.path.dirname(ROOT), ".env.local")  # at the top of the repo
 API = "https://api.elevenlabs.io"
 DEVICE = os.environ.get("DEVICE", "893484B9-033A-5427-9561-A3DF76E94ACC")
 APP = os.environ.get("APP", "dev.bugatti.RoomTwinLol")

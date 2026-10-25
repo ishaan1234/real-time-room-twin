@@ -4,6 +4,10 @@ xcuserdata/
 .DS_Store
 scans/
 .env.local
-RoomTwin/supabase.json
+ios-mac/RoomTwin/supabase.json
 __pycache__/
 *.pyc
+windows/node_modules/
+windows/dist/
+windows/public/test-room.ply
+.env
