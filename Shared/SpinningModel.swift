@@ -14,16 +14,26 @@ typealias PlatformViewRepresentable = NSViewRepresentable
 /// RoomTwin Viewer.
 struct SpinningModel: PlatformViewRepresentable {
     let url: URL
+    /// False holds it still, so nothing is drawn while it waits out of sight.
+    var isPlaying = true
+    /// Called once the model is loaded and on the GPU, when it can appear
+    /// without a hitch.
+    var onReady: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     #if canImport(UIKit)
     func makeUIView(context: Context) -> SCNView { makeView(context.coordinator) }
-    func updateUIView(_ view: SCNView, context: Context) { show(url, in: view, context.coordinator) }
+    func updateUIView(_ view: SCNView, context: Context) { update(view, context.coordinator) }
     #else
     func makeNSView(context: Context) -> SCNView { makeView(context.coordinator) }
-    func updateNSView(_ view: SCNView, context: Context) { show(url, in: view, context.coordinator) }
+    func updateNSView(_ view: SCNView, context: Context) { update(view, context.coordinator) }
     #endif
+
+    private func update(_ view: SCNView, _ coordinator: Coordinator) {
+        show(url, in: view, coordinator)
+        view.isPlaying = isPlaying
+    }
 
     private func makeView(_ coordinator: Coordinator) -> SCNView {
         let view = SCNView()
@@ -33,7 +43,7 @@ struct SpinningModel: PlatformViewRepresentable {
         view.defaultCameraController.interactionMode = .orbitTurntable
         view.defaultCameraController.inertiaEnabled = true
         view.delegate = coordinator
-        show(url, in: view, coordinator)
+        update(view, coordinator)
         return view
     }
 
@@ -46,7 +56,10 @@ struct SpinningModel: PlatformViewRepresentable {
         view.defaultCameraController.target = SCNVector3Zero
         coordinator.watch(camera: camera, turntable: scene.rootNode.childNode(withName: "turntable", recursively: false),
                           headlight: scene.rootNode.childNode(withName: "headlight", recursively: false))
-        view.isPlaying = true
+        // Uploads the textures and geometry and builds the shaders now,
+        // rather than on the first frame it's seen.
+        let onReady = onReady
+        view.prepare([scene]) { _ in DispatchQueue.main.async { onReady?() } }
     }
 
     /// Keeps the light pointing along the view, and stops the turntable as

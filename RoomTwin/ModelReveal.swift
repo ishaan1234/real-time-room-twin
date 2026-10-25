@@ -2,7 +2,8 @@ import SwiftUI
 
 /// Shown when a model is ready: the picture greys out and the model pops out
 /// of it and spins. Dragging the model turns it and pinching zooms; swiping up
-/// anywhere else sends it to RoomTwin Viewer on the Mac. Save to My Objects
+/// anywhere else sends it to RoomTwin Viewer on the Mac. Pre-load sends it
+/// ahead, so the Mac has it loaded and the swipe shows it at once. Save to My Objects
 /// keeps it in the account, to add to room previews later.
 struct ModelReveal: View {
     let model: URL
@@ -12,6 +13,9 @@ struct ModelReveal: View {
     @ObservedObject var sender: ModelSender
     let onAR: () -> Void
     let onClose: () -> Void
+    /// Set for an object opened from My Objects: it's saved already, so
+    /// there's no Save button, and it goes to the Mac under this name.
+    var savedName: String? = nil
 
     @State private var popped = false
     /// How far the model is dragged up (negative).
@@ -83,11 +87,12 @@ struct ModelReveal: View {
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.6))
             Group {
-                if let mac = sender.macs.first {
+                if let mac = sender.knownMac {
                     VStack(spacing: 2) {
                         Image(systemName: "chevron.up")
                             .symbolEffect(.bounce, options: .repeating.speed(0.5))
-                        Text("Swipe up here to send to \(mac)")
+                        Text(sender.preloadState(for: model) == .ready ? "Swipe up here to show it on \(mac)"
+                             : "Swipe up here to send to \(mac)")
                     }
                     .font(.footnote)
                     .foregroundStyle(.white.opacity(0.85))
@@ -101,7 +106,8 @@ struct ModelReveal: View {
             .frame(maxWidth: .infinity)
             .contentShape(Rectangle())
             .gesture(swipeUp)
-            saveButton
+            if let mac = sender.knownMac { preloadButton(mac) }
+            if savedName == nil { saveButton }
             HStack(spacing: 12) {
                 Button("Close", systemImage: "xmark", action: onClose)
                     .buttonStyle(.bordered)
@@ -116,6 +122,38 @@ struct ModelReveal: View {
         .padding(.top, 60)
         .padding(.bottom, 40)
         .animation(.easeInOut(duration: 0.25), value: sender.status)
+    }
+
+    /// Loads the model on the Mac out of sight, so the swipe shows it at once.
+    private func preloadButton(_ mac: String) -> some View {
+        Group {
+            switch sender.preloadState(for: model) {
+            case .none:
+                Button("Pre-load on \(mac)", systemImage: "arrow.down.circle") {
+                    sender.preload(model, name: transferName)
+                }
+            case .loading:
+                Label { Text("Pre-loading on \(mac)…") } icon: { ProgressView().tint(.white) }
+            case .ready:
+                Label { Text("Pre-loaded on \(mac)") } icon: {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                }
+            case .failed(let message):
+                Button("Pre-load failed: \(message) Tap to retry.", systemImage: "exclamationmark.triangle") {
+                    sender.preload(model, name: transferName)
+                }
+            }
+        }
+        .font(.footnote.weight(.medium))
+        .buttonStyle(.borderedProminent)
+        .tint(.white.opacity(0.25))
+        .foregroundStyle(.white)
+        .animation(.easeInOut(duration: 0.2), value: sender.preloadState(for: model))
+    }
+
+    /// The model's name on the Mac: its saved name, or its scan folder's.
+    private var transferName: String {
+        (savedName ?? model.deletingLastPathComponent().lastPathComponent) + ".usdz"
     }
 
     private var saveButton: some View {
@@ -165,7 +203,7 @@ struct ModelReveal: View {
             .onChanged { lift = min(0, $0.translation.height) }
             .onEnded { value in
                 let flung = value.translation.height < -120 || value.predictedEndTranslation.height < -350
-                guard flung, sender.send(model, name: model.deletingLastPathComponent().lastPathComponent + ".usdz") else {
+                guard flung, sender.send(model, name: transferName) else {
                     withAnimation(.spring(response: 0.4, dampingFraction: 0.7)) { lift = 0 }
                     return
                 }

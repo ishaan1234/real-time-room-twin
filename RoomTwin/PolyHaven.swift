@@ -47,6 +47,15 @@ enum PolyHaven {
              avoid: [])
     }
 
+    /// Materials suitable for floors or furniture. The query remains the main
+    /// ranking signal; these categories only break close ties.
+    @MainActor
+    static func surfaceTextures(matching query: String) async throws -> [Asset] {
+        rank(try await catalog("textures"), query,
+             prefer: ["floor", "indoor", "wood", "tiles", "stone", "concrete", "fabric", "leather", "clean"],
+             avoid: ["terrain", "outdoor", "aerial"])
+    }
+
     @MainActor
     private static func catalog(_ type: String) async throws -> [Asset] {
         if let cached = catalogs[type] { return cached }

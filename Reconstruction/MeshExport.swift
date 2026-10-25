@@ -6,11 +6,21 @@ import simd
 
 /// A compacted copy of the live mesh.
 struct MeshSnapshot {
+    struct EditableObject {
+        /// Human-readable RoomPlan category, made unique within the room.
+        var name: String
+        /// Faces occupied by this object in the untouched snapshot.
+        var faces: Range<Int>
+    }
+
     var positions: [SIMD3<Float>] = []
     var colors: [SIMD3<UInt8>] = []
     var faces: [SIMD3<UInt32>] = []
     /// Pool index of each snapshot vertex.
     var poolIndices: [Int32] = []
+    /// Named object ranges are populated by RoomPlan. Detailed LiDAR meshes
+    /// have no semantic object labels, so this remains empty for them.
+    var editableObjects: [EditableObject] = []
 }
 
 extension Reconstructor {
@@ -98,7 +108,7 @@ extension MeshSnapshot {
     /// Viewers blend neighbouring cells when the model is small on screen, so
     /// triangles are sorted along a 3D Z-order curve and their cells laid out
     /// in 2D Z-order tiles: cells that get blended belong to nearby triangles.
-    func writeUSDZ(to url: URL) throws {
+    func writeUSDZ(to url: URL, adding nodes: [SCNNode] = []) throws {
         guard !faces.isEmpty else { throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: url.path]) }
         let tileSide = 32, cellsPerTile = tileSide * tileSide
         let tileCount = (faces.count + cellsPerTile - 1) / cellsPerTile
@@ -177,6 +187,9 @@ extension MeshSnapshot {
         let node = SCNNode(geometry: geometry)
         node.name = "Scan"
         scene.rootNode.addChildNode(node)
+        for decoration in nodes {
+            scene.rootNode.addChildNode(decoration)
+        }
         guard scene.write(to: url, options: nil, delegate: nil, progressHandler: nil) else {
             throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: url.path])
         }

@@ -42,3 +42,46 @@ drop policy if exists "own object files: delete" on storage.objects;
 create policy "own object files: delete" on storage.objects
     for delete to authenticated
     using (bucket_id = 'objects' and (storage.foldername(name))[1] = auth.uid()::text);
+
+-- Saved RoomPlan layouts. The model is the edited USDZ shown in Orbit/Walk;
+-- PLY is the raw vertex-colour geometry and JSON keeps RoomPlan's semantic
+-- walls, openings and furniture data.
+create table if not exists public.room_layouts (
+    id uuid primary key default gen_random_uuid(),
+    owner uuid not null default auth.uid() references auth.users (id) on delete cascade,
+    name text not null check (char_length(name) between 1 and 80),
+    model_path text not null,
+    ply_path text not null,
+    json_path text not null,
+    created_at timestamptz not null default now()
+);
+alter table public.room_layouts enable row level security;
+grant select, insert, delete on public.room_layouts to authenticated;
+
+drop policy if exists "own room layouts: read" on public.room_layouts;
+create policy "own room layouts: read" on public.room_layouts
+    for select to authenticated using (owner = auth.uid());
+drop policy if exists "own room layouts: add" on public.room_layouts;
+create policy "own room layouts: add" on public.room_layouts
+    for insert to authenticated with check (owner = auth.uid());
+drop policy if exists "own room layouts: delete" on public.room_layouts;
+create policy "own room layouts: delete" on public.room_layouts
+    for delete to authenticated using (owner = auth.uid());
+
+-- A detailed room can be larger than a single scanned object.
+insert into storage.buckets (id, name, public, file_size_limit)
+values ('room-layouts', 'room-layouts', false, 157286400)
+on conflict (id) do update set public = false, file_size_limit = excluded.file_size_limit;
+
+drop policy if exists "own room layout files: read" on storage.objects;
+create policy "own room layout files: read" on storage.objects
+    for select to authenticated
+    using (bucket_id = 'room-layouts' and (storage.foldername(name))[1] = auth.uid()::text);
+drop policy if exists "own room layout files: add" on storage.objects;
+create policy "own room layout files: add" on storage.objects
+    for insert to authenticated
+    with check (bucket_id = 'room-layouts' and (storage.foldername(name))[1] = auth.uid()::text);
+drop policy if exists "own room layout files: delete" on storage.objects;
+create policy "own room layout files: delete" on storage.objects
+    for delete to authenticated
+    using (bucket_id = 'room-layouts' and (storage.foldername(name))[1] = auth.uid()::text);

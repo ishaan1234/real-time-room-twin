@@ -5,17 +5,23 @@ import SwiftUI
 /// Waits for models from the RoomTwin app and lands them on a transparent
 /// layer over the screen. Models are saved in ~/Downloads/RoomTwin; one sent
 /// again isn't saved twice, it shakes if it's on screen and lands again if not.
+/// A preloaded model waits on the layer out of sight, loaded, until the phone
+/// is swiped and says to show it.
 final class Viewer: NSObject, ObservableObject {
     static let shared = Viewer()
 
-    struct Arrival: Equatable {
+    struct Arrival: Equatable, Identifiable {
         let model: URL
         let from: String
-        let id = UUID()
+        var id = UUID().uuidString
     }
 
     /// The model on screen, if any.
     @Published private(set) var arrival: Arrival?
+    /// A preloaded model, waiting just below the screen. Its ID is the phone's preload ID.
+    @Published private(set) var staged: Arrival?
+    /// The phone to tell when the staged model is ready.
+    private var stagedPeer: MCPeerID?
     /// Names of the connected phones.
     @Published private(set) var phones: [String] = []
     @Published private(set) var lastModel: URL?
@@ -50,13 +56,53 @@ final class Viewer: NSObject, ObservableObject {
         }
     }
 
+    /// Everything on the layer: the model on screen and the one staged.
+    var models: [Arrival] {
+        [arrival, staged].compactMap { $0 }
+    }
+
     func land(_ model: URL, from phone: String) {
-        lastModel = model
+        land(Arrival(model: model, from: phone))
+    }
+
+    private func land(_ arrival: Arrival) {
+        lastModel = arrival.model
         window?.cover(NSScreen.main)
         window?.ignoresMouseEvents = false
         window?.orderFrontRegardless()
         window?.makeKey()
-        arrival = Arrival(model: model, from: phone)
+        self.arrival = arrival
+    }
+
+    /// Puts a preloaded model on the layer out of sight, where it loads;
+    /// `stagedIsReady` then tells the phone.
+    private func stage(_ model: URL, id: String, from peer: MCPeerID) {
+        staged = Arrival(model: model, from: peer.displayName, id: id)
+        stagedPeer = peer
+    }
+
+    /// Called by the landing view once the staged model is loaded and on the GPU.
+    func stagedIsReady(_ id: String) {
+        guard staged?.id == id, let stagedPeer else { return }
+        tell(stagedPeer, .ready, id)
+    }
+
+    /// The phone was swiped: the staged model flies up straight away.
+    private func show(_ id: String, for peer: MCPeerID) {
+        if arrival?.id == id {
+            shake()
+        } else if let staged, staged.id == id {
+            self.staged = nil
+            stagedPeer = nil
+            land(staged)
+        } else {
+            tell(peer, .missing, id)
+        }
+    }
+
+    private func tell(_ peer: MCPeerID, _ kind: ModelTransfer.Message.Kind, _ id: String) {
+        guard let data = try? JSONEncoder().encode(ModelTransfer.Message(kind: kind, id: id)) else { return }
+        try? session.send(data, toPeers: [peer], with: .reliable)
     }
 
     /// "Already here": the model on screen shakes its head.
@@ -108,12 +154,15 @@ extension Viewer: MCSessionDelegate {
     func session(_ session: MCSession, didFinishReceivingResourceWithName resourceName: String, fromPeer peerID: MCPeerID,
                  at localURL: URL?, withError error: Error?) {
         // The received file is deleted when this returns, so move it first.
-        guard let localURL, error == nil, let (model, isDuplicate) = try? keep(localURL, named: resourceName) else {
+        let (name, preloadID) = ModelTransfer.parse(resourceName: resourceName)
+        guard let localURL, error == nil, let (model, isDuplicate) = try? keep(localURL, named: name) else {
             NSLog("RoomTwin Viewer: couldn't receive \(resourceName): \(String(describing: error))")
             return
         }
         DispatchQueue.main.async {
-            if isDuplicate && self.arrival?.model == model {
+            if let preloadID {
+                self.stage(model, id: preloadID, from: peerID)
+            } else if isDuplicate && self.arrival?.model == model {
                 self.shake()
             } else {
                 self.land(model, from: peerID.displayName)
@@ -121,7 +170,11 @@ extension Viewer: MCSessionDelegate {
         }
     }
 
-    func session(_ session: MCSession, didReceive data: Data, fromPeer peerID: MCPeerID) {}
+    func session(_ session: MCSession, didReceive data: Data, fromPeer peerID: MCPeerID) {
+        guard let message = try? JSONDecoder().decode(ModelTransfer.Message.self, from: data),
+              message.kind == .show else { return }
+        DispatchQueue.main.async { self.show(message.id, for: peerID) }
+    }
     func session(_ session: MCSession, didReceive stream: InputStream, withName streamName: String, fromPeer peerID: MCPeerID) {}
     func session(_ session: MCSession, didStartReceivingResourceWithName resourceName: String, fromPeer peerID: MCPeerID,
                  with progress: Progress) {}

@@ -30,12 +30,18 @@ enum RoomPlanMesh {
         } else {
             for floor in room.floors { builder.addFloor(floor) }
         }
+        var counts: [String: Int] = [:]
         for object in room.objects {
+            let kind = name(of: object.category)
+            counts[kind, default: 0] += 1
+            let label = "\(kind) \(counts[kind]!)"
+            let firstFace = builder.mesh.faces.count
             if let model = library[name(of: object.category)] {
                 builder.addModel(model, fitting: object)
             } else {
                 builder.addBox(object)
             }
+            builder.mesh.editableObjects.append(.init(name: label, faces: firstFace..<builder.mesh.faces.count))
         }
         return builder.mesh
     }
@@ -80,16 +86,28 @@ private struct Builder {
 
     mutating func addWall(_ wall: CapturedRoom.Surface, holes: [CapturedRoom.Surface], facing centre: SIMD3<Float>) {
         let half = SIMD2(wall.dimensions.x, wall.dimensions.y) / 2
+        // RoomPlan may return a non-rectangular wall polygon (for example a
+        // gable or a wall following a sloped ceiling). Keep that outline
+        // instead of replacing it with dimensions.x by dimensions.y.
+        var outline = wall.polygonCorners.count >= 3
+            ? wall.polygonCorners.map { SIMD2($0.x, $0.y) }
+            : [SIMD2(-half.x, -half.y), SIMD2(half.x, -half.y),
+               SIMD2(half.x, half.y), SIMD2(-half.x, half.y)]
+        if signedArea(outline) < 0 { outline.reverse() }
+        let outlineLow = outline.reduce(SIMD2<Float>(repeating: .infinity), simd_min)
+        let outlineHigh = outline.reduce(SIMD2<Float>(repeating: -.infinity), simd_max)
         // Each hole as a rectangle in the wall's own plane.
         let inverse = wall.transform.inverse
         let cuts = holes.map { hole -> (low: SIMD2<Float>, high: SIMD2<Float>) in
             let corners = Self.corners(of: hole).map { inverse * SIMD4($0, 1) }
             let xs = corners.map(\.x), ys = corners.map(\.y)
-            return (simd_clamp(SIMD2(xs.min()!, ys.min()!), -half, half), simd_clamp(SIMD2(xs.max()!, ys.max()!), -half, half))
+            return (simd_clamp(SIMD2(xs.min()!, ys.min()!), outlineLow, outlineHigh),
+                    simd_clamp(SIMD2(xs.max()!, ys.max()!), outlineLow, outlineHigh))
         }
-        // Split the wall on every hole edge and keep the cells outside all holes.
-        let xs = Set([-half.x, half.x] + cuts.flatMap { [$0.low.x, $0.high.x] }).sorted()
-        let ys = Set([-half.y, half.y] + cuts.flatMap { [$0.low.y, $0.high.y] }).sorted()
+        // Split on every outline coordinate and hole edge. Each grid cell is
+        // clipped back to the true polygon, preserving diagonal top edges.
+        let xs = Set(outline.map(\.x) + cuts.flatMap { [$0.low.x, $0.high.x] }).sorted()
+        let ys = Set(outline.map(\.y) + cuts.flatMap { [$0.low.y, $0.high.y] }).sorted()
         let flip = simd_dot(wall.transform.normal, centre - wall.transform.position) < 0
         for i in 0..<xs.count - 1 {
             for j in 0..<ys.count - 1 {
@@ -97,8 +115,26 @@ private struct Builder {
                 let middle = (low + high) / 2
                 guard high.x - low.x > 1e-4, high.y - low.y > 1e-4,
                       !cuts.contains(where: { all(middle .> $0.low) && all(middle .< $0.high) }) else { continue }
-                addQuad(low: low, high: high, depth: 0, transform: wall.transform, colour: Colour.wall, flip: flip)
+                let clipped = clip(outline, to: low, high: high)
+                guard clipped.count >= 3 else { continue }
+                let corners = clipped.map { (wall.transform * SIMD4($0.x, $0.y, 0, 1)).xyz }
+                addPolygon(flip ? corners.reversed() : corners, colour: Colour.wall)
             }
+        }
+
+        // RoomPlan's result view gives walls a narrow top/sloped cap. Keep it
+        // in Orbit/Walk too, without adding an exterior wall face that would
+        // stop the near wall disappearing in dollhouse view.
+        let outsideDepth: Float = flip ? 0.08 : -0.08
+        for (a, b) in zip(outline, outline.dropFirst() + outline.prefix(1)) {
+            let edge = b - a
+            let outward = simd_normalize(SIMD2(edge.y, -edge.x))
+            guard outward.y > 0.15 else { continue } // top and sloped-top edges only
+            let local = [SIMD3(a.x, a.y, 0), SIMD3(b.x, b.y, 0),
+                         SIMD3(b.x, b.y, outsideDepth), SIMD3(a.x, a.y, outsideDepth)]
+            let corners = local.map { (wall.transform * SIMD4($0, 1)).xyz }
+            let desired = simd_normalize((wall.transform * SIMD4(outward.x, outward.y, 0, 0)).xyz)
+            addPolygon(corners, colour: Colour.wall, facing: desired)
         }
     }
 
@@ -130,7 +166,8 @@ private struct Builder {
     mutating func addBox(_ object: CapturedRoom.Object) {
         let half = object.dimensions / 2
         let colour = Colour.object(object.category)
-        let centre = object.transform.position
+        let transform = Self.upright(object.transform)
+        let centre = transform.position
         // Each face as (axis, sign); its two in-plane axes follow it.
         for axis in 0..<3 {
             for sign: Float in [-1, 1] {
@@ -141,7 +178,7 @@ private struct Builder {
                     p[axis] = sign * half[axis]
                     p[u] = a * half[u]
                     p[v] = b * half[v]
-                    corners.append((object.transform * SIMD4(p, 1)).xyz)
+                    corners.append((transform * SIMD4(p, 1)).xyz)
                 }
                 let faceCentre = corners.reduce(.zero, +) / 4
                 let outward = simd_dot(simd_cross(corners[1] - corners[0], corners[2] - corners[0]), faceCentre - centre) > 0
@@ -156,12 +193,33 @@ private struct Builder {
         let high = model.positions.reduce(SIMD3<Float>(repeating: -.infinity), simd_max)
         let middle = (low + high) / 2
         let scale = object.dimensions / simd_max(high - low, SIMD3(repeating: 1e-4))
+        let transform = Self.upright(object.transform)
         let base = UInt32(mesh.positions.count)
         for (p, c) in zip(model.positions, model.colors) {
-            mesh.positions.append((object.transform * SIMD4((p - middle) * scale, 1)).xyz)
+            mesh.positions.append((transform * SIMD4((p - middle) * scale, 1)).xyz)
             mesh.colors.append(c)
         }
         mesh.faces += model.faces.map { $0 &+ base }
+    }
+
+    /// RoomPlan can report furniture beside a wall with a small pitch or roll.
+    /// Furniture still stands under gravity, so retain only its horizontal
+    /// heading and translation. This keeps chairs and tables from leaning
+    /// into the wall in Orbit/Walk.
+    private static func upright(_ transform: simd_float4x4) -> simd_float4x4 {
+        var forward = SIMD3(transform.columns.2.x, 0, transform.columns.2.z)
+        if simd_length_squared(forward) < 1e-5 {
+            let right = SIMD3(transform.columns.0.x, 0, transform.columns.0.z)
+            forward = SIMD3(-right.z, 0, right.x)
+        }
+        forward = simd_normalize(forward)
+        let right = simd_normalize(SIMD3(forward.z, 0, -forward.x))
+        var result = matrix_identity_float4x4
+        result.columns.0 = SIMD4(right, 0)
+        result.columns.1 = SIMD4(0, 1, 0, 0)
+        result.columns.2 = SIMD4(forward, 0)
+        result.columns.3 = SIMD4(transform.position, 1)
+        return result
     }
 
     // MARK: Primitives
@@ -199,11 +257,57 @@ private struct Builder {
         }
     }
 
+    /// Adds a polygon after orienting it toward the requested normal.
+    private mutating func addPolygon(_ corners: [SIMD3<Float>], colour: SIMD3<UInt8>, facing normal: SIMD3<Float>) {
+        guard corners.count >= 3 else { return }
+        let facesForward = simd_dot(simd_cross(corners[1] - corners[0], corners[2] - corners[0]), normal) >= 0
+        addPolygon(facesForward ? corners : corners.reversed(), colour: colour)
+    }
+
     private static func corners(of surface: CapturedRoom.Surface) -> [SIMD3<Float>] {
         let half = SIMD2(surface.dimensions.x, surface.dimensions.y) / 2
         return [SIMD2(-half.x, -half.y), SIMD2(half.x, -half.y), SIMD2(half.x, half.y), SIMD2(-half.x, half.y)]
             .map { (surface.transform * SIMD4($0.x, $0.y, 0, 1)).xyz }
     }
+}
+
+private func signedArea(_ points: [SIMD2<Float>]) -> Float {
+    guard points.count >= 3 else { return 0 }
+    return zip(points, points.dropFirst() + points.prefix(1)).reduce(0) {
+        $0 + $1.0.x * $1.1.y - $1.1.x * $1.0.y
+    } / 2
+}
+
+/// Sutherland-Hodgman clipping against an axis-aligned rectangle. Clipping
+/// each grid cell to RoomPlan's outline keeps diagonal/gabled wall tops exact
+/// while the grid edges still cut rectangular doors and windows cleanly.
+private func clip(_ polygon: [SIMD2<Float>], to low: SIMD2<Float>, high: SIMD2<Float>) -> [SIMD2<Float>] {
+    func halfPlane(_ input: [SIMD2<Float>], inside: (SIMD2<Float>) -> Bool,
+                   crossing: (SIMD2<Float>, SIMD2<Float>) -> SIMD2<Float>) -> [SIMD2<Float>] {
+        guard var previous = input.last else { return [] }
+        var output: [SIMD2<Float>] = []
+        var previousInside = inside(previous)
+        for point in input {
+            let pointInside = inside(point)
+            if pointInside != previousInside { output.append(crossing(previous, point)) }
+            if pointInside { output.append(point) }
+            previous = point
+            previousInside = pointInside
+        }
+        return output
+    }
+    func atX(_ x: Float, _ a: SIMD2<Float>, _ b: SIMD2<Float>) -> SIMD2<Float> {
+        a + (b - a) * ((x - a.x) / (b.x - a.x))
+    }
+    func atY(_ y: Float, _ a: SIMD2<Float>, _ b: SIMD2<Float>) -> SIMD2<Float> {
+        a + (b - a) * ((y - a.y) / (b.y - a.y))
+    }
+    var result = polygon
+    result = halfPlane(result, inside: { $0.x >= low.x - 1e-5 }, crossing: { atX(low.x, $0, $1) })
+    result = halfPlane(result, inside: { $0.x <= high.x + 1e-5 }, crossing: { atX(high.x, $0, $1) })
+    result = halfPlane(result, inside: { $0.y >= low.y - 1e-5 }, crossing: { atY(low.y, $0, $1) })
+    result = halfPlane(result, inside: { $0.y <= high.y + 1e-5 }, crossing: { atY(high.y, $0, $1) })
+    return result
 }
 
 /// Triangles of a simple polygon given counter-clockwise, as index triples.

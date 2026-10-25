@@ -18,6 +18,8 @@ final class ScanController: ObservableObject {
     @Published private(set) var isExporting = false
     /// The scan as a 3D scene to look round, while the preview is open.
     @Published private(set) var preview: PreviewScene?
+    @Published private(set) var isPreviewOpen = false
+    @Published private(set) var isARPreviewActive = false
     @Published private(set) var isPreparingPreview = false
     /// Why frames aren't being fused right now, if tracking isn't normal.
     @Published private(set) var trackingHint: String?
@@ -26,6 +28,9 @@ final class ScanController: ObservableObject {
 
     let view = MTKView()
     private var renderer: ScanRenderer?
+    /// Scanning has gone on since the preview was made, so it shows less
+    /// than the scan does; View and Export make it afresh.
+    private var isPreviewStale = false
     /// Each scan gets a folder in Documents with its keyframes and exports.
     private var keyframes: KeyframeRecorder?
     private var isActive = true
@@ -64,9 +69,10 @@ final class ScanController: ObservableObject {
         updateDrawing()
     }
 
-    /// The live view also stops while the preview covers it.
+    /// The live view stops behind Orbit/Walk, but remains visible beneath the
+    /// transparent SceneKit overlay in AR Edit.
     private func updateDrawing() {
-        view.isPaused = !isActive || preview != nil
+        view.isPaused = !isActive || (isPreviewOpen && !isARPreviewActive)
     }
 
     /// Reading the mesh pools while the GPU writes them would give a torn
@@ -91,6 +97,10 @@ final class ScanController: ObservableObject {
     var currentFrame: ARFrame? {
         renderer?.session.currentFrame
     }
+
+    /// The scanner's existing world-tracking session. AR Edit reuses it so no
+    /// second camera session competes with reconstruction.
+    var arSession: ARSession? { renderer?.session }
 
     /// Object Capture and AR Quick Look need the camera to themselves. Unlike
     /// stop(), this keeps the screen awake.
@@ -120,6 +130,10 @@ final class ScanController: ObservableObject {
         keyframes?.discard()
         keyframes = nil
         renderer?.keyframes = nil
+        preview = nil
+        isPreviewStale = false
+        isPreviewOpen = false
+        isARPreviewActive = false
         hasStarted = false
         Diagnostics.action("reset")
     }
@@ -129,8 +143,17 @@ final class ScanController: ObservableObject {
         Diagnostics.action("export")
         isExporting = true
         setScanning(false)
+        if isPreviewStale {
+            // The edits are exported with the scan they were made on, so bring that up to date first.
+            buildPreview { [weak self] in
+                self?.isExporting = false
+                self?.export()
+            }
+            return
+        }
         let reconstructor = renderer.reconstructor
         let folder = keyframes?.folder ?? Self.documents
+        let edits = preview?.exportContents()
         renderer.whenGPUIdle { [weak self] in
             var stepStart = ProcessInfo.processInfo.systemUptime
             func step(_ name: String) {
@@ -146,7 +169,13 @@ final class ScanController: ObservableObject {
             let result = Result {
                 try mesh.writePLY(to: ply)
                 step("PLY")
-                try mesh.writeUSDZ(to: usdz)
+                var exportMesh = edits?.scan ?? mesh
+                if let edits {
+                    exportMesh.faces = exportMesh.faces.enumerated().compactMap {
+                        edits.replacedScanFaces.contains($0.offset) ? nil : $0.element
+                    }
+                }
+                try exportMesh.writeUSDZ(to: usdz, adding: edits?.nodes ?? [])
                 step("USDZ")
             }
             DispatchQueue.main.async {
@@ -165,10 +194,30 @@ final class ScanController: ObservableObject {
     /// Pauses scanning and opens the scan as a 3D scene. Scanning can resume
     /// after closing it.
     func openPreview() {
-        guard let renderer, !isBusy else { return }
+        guard renderer != nil, !isBusy else { return }
         Diagnostics.action("preview")
+        if preview != nil, !isPreviewStale {
+            isARPreviewActive = false
+            isPreviewOpen = true
+            updateDrawing()
+            return
+        }
         isPreparingPreview = true
         setScanning(false)
+        buildPreview { [weak self] in
+            guard let self else { return }
+            self.isPreparingPreview = false
+            guard self.preview != nil else { return }
+            self.isARPreviewActive = false
+            self.isPreviewOpen = true
+            self.updateDrawing()
+        }
+    }
+
+    /// Makes the preview from the scan as it is now. One made before, from
+    /// less of the scan, hands its furniture and looks over to the new one.
+    private func buildPreview(then done: @escaping () -> Void) {
+        guard let renderer else { return }
         let reconstructor = renderer.reconstructor
         let viewer = renderer.session.currentFrame?.camera.transform
         renderer.whenGPUIdle { [weak self] in
@@ -179,26 +228,41 @@ final class ScanController: ObservableObject {
                                    (ProcessInfo.processInfo.systemUptime - start) * 1000))
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.isPreparingPreview = false
-                guard let preview else {
+                self.isPreviewStale = false
+                if let preview {
+                    if let earlier = self.preview { preview.continueEdits(from: earlier) }
+                    self.preview = preview
+                } else {
                     self.errorMessage = "Nothing scanned yet. Scan for a few seconds first."
-                    return
                 }
-                self.preview = preview
-                self.updateDrawing()
+                done()
             }
         }
     }
 
     func closePreview() {
         Diagnostics.action("close preview")
-        preview = nil
+        renderer?.viewMode = viewMode
+        isARPreviewActive = false
+        isPreviewOpen = false
         updateDrawing()
+    }
+
+    func setARPreviewActive(_ active: Bool) {
+        guard isPreviewOpen, active != isARPreviewActive else { return }
+        isARPreviewActive = active
+        // The ARSession intentionally remains running throughout the detailed
+        // preview, preserving its world origin. In AR Edit Metal draws only
+        // the camera; SceneKit supplies the editable virtual furniture.
+        renderer?.viewMode = active ? .hidden : viewMode
+        updateDrawing()
+        Diagnostics.action(active ? "AR edit" : "preview camera")
     }
 
     private func setScanning(_ scanning: Bool) {
         isScanning = scanning
         renderer?.isScanning = scanning
+        if scanning, preview != nil { isPreviewStale = true }
     }
 
     private func startRecording() {

@@ -167,7 +167,22 @@ def main():
     assert len(rows) == 1, rows
     call(url, key, "DELETE", f"rest/v1/objects?id=eq.{rows[0]['id']}", token=token)
     call(url, key, "DELETE", "storage/v1/object/objects", {"prefixes": [f"{folder}/model.usdz"]}, token)
-    print("== sign-up, upload, save, list and delete all work")
+
+    room_folder = f"{user}/{uuid.uuid4()}"
+    room_files = {"room.usdz": "model/vnd.usdz+zip", "room.ply": "application/octet-stream",
+                  "room.json": "application/json"}
+    for filename, content_type in room_files.items():
+        call(url, key, "POST", f"storage/v1/object/room-layouts/{room_folder}/{filename}",
+             b"check", token, content_type)
+    call(url, key, "POST", "rest/v1/room_layouts",
+         {"name": "setup room", "model_path": f"{room_folder}/room.usdz",
+          "ply_path": f"{room_folder}/room.ply", "json_path": f"{room_folder}/room.json"}, token)
+    rooms = call(url, key, "GET", "rest/v1/room_layouts?select=id,model_path", token=token)
+    assert len(rooms) == 1, rooms
+    call(url, key, "DELETE", f"rest/v1/room_layouts?id=eq.{rooms[0]['id']}", token=token)
+    call(url, key, "DELETE", "storage/v1/object/room-layouts",
+         {"prefixes": [f"{room_folder}/{name}" for name in room_files]}, token)
+    print("== object and room-layout sign-up, upload, save, list and delete all work")
     if env.get("SUPABASE_DB_URL"):
         sql(env["SUPABASE_DB_URL"], "-c", f"delete from auth.users where email = '{email}'")
         print("   (and the throwaway user is gone)")

@@ -8,11 +8,14 @@ import SceneKit
 /// so each is scaled to a height the voice agent estimates. Most are CC BY:
 /// whoever sees them must be told the model's name, author and licence.
 enum Sketchfab {
-    struct Model {
+    struct Model: Identifiable {
         let uid: String
         let name: String
         let author: String
         let license: String
+        let thumbnailURL: URL?
+
+        var id: String { uid }
 
         /// The credit CC BY asks for.
         var attribution: String { "“\(name)” by \(author) (\(license)) on Sketchfab" }
@@ -39,19 +42,43 @@ enum Sketchfab {
 
     /// Downloadable models matching `query` with a USDZ small enough to fetch quickly, most relevant first.
     static func models(matching query: String) async throws -> [Model] {
-        let url = api.appendingPathComponent("search").appending(queryItems: [
-            .init(name: "type", value: "models"), .init(name: "q", value: query),
-            .init(name: "downloadable", value: "true"), .init(name: "count", value: "24"),
-        ])
+        try await search(query: query)
+    }
+
+    /// Five lightweight suggestions for the visual library browser. The API
+    /// supplies a general downloadable-model feed; shuffling a page locally
+    /// avoids extra requests and makes Refresh useful without loading a large
+    /// catalogue into the UI.
+    static func suggestions(limit: Int = 5) async throws -> [Model] {
+        // Keep the random feed relevant to a room; a completely unfiltered
+        // Sketchfab page is often dominated by buildings and scanned terrain.
+        Array(try await search(query: "furniture").shuffled().prefix(limit))
+    }
+
+    private static func search(query: String?) async throws -> [Model] {
+        var items = [URLQueryItem(name: "type", value: "models"),
+                     .init(name: "downloadable", value: "true"),
+                     .init(name: "count", value: "24")]
+        if let query, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            items.append(.init(name: "q", value: query))
+        }
+        let url = api.appendingPathComponent("search").appending(queryItems: items)
         let json = try JSONSerialization.jsonObject(with: try await fetch(url)) as? [String: Any]
         let results = json?["results"] as? [[String: Any]] ?? []
         return results.compactMap { result in
             guard let uid = result["uid"] as? String, let name = result["name"] as? String,
                   let usdz = (result["archives"] as? [String: Any])?["usdz"] as? [String: Any],
                   let size = usdz["size"] as? Int, size <= largestDownload else { return nil }
+            let images = ((result["thumbnails"] as? [String: Any])?["images"] as? [[String: Any]]) ?? []
+            // Around 320 px is ample for the 64-point row and avoids fetching
+            // a multi-megapixel thumbnail when Sketchfab provides variants.
+            let thumbnail = images.min {
+                abs(($0["width"] as? Int ?? 320) - 320) < abs(($1["width"] as? Int ?? 320) - 320)
+            }.flatMap { ($0["url"] as? String).flatMap(URL.init(string:)) }
             return Model(uid: uid, name: name,
                          author: (result["user"] as? [String: Any])?["username"] as? String ?? "unknown",
-                         license: (result["license"] as? [String: Any])?["label"] as? String ?? "see Sketchfab")
+                         license: (result["license"] as? [String: Any])?["label"] as? String ?? "see Sketchfab",
+                         thumbnailURL: thumbnail)
         }
     }
 

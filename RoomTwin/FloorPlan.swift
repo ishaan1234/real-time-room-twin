@@ -10,7 +10,7 @@ struct FloorPlan {
     private let columns: Int, rows: Int
     private var blocked: [Bool], floor: [Bool]
 
-    init(_ mesh: MeshSnapshot, floorY: Float) {
+    init(_ mesh: MeshSnapshot, floorY: Float, excludingFaces excluded: Set<Int> = []) {
         let lo = mesh.positions.reduce(SIMD3<Float>(repeating: .infinity), simd_min)
         let hi = mesh.positions.reduce(SIMD3<Float>(repeating: -.infinity), simd_max)
         origin = SIMD2(lo.x, lo.z)
@@ -18,7 +18,7 @@ struct FloorPlan {
         rows = Int((hi.z - lo.z) / Self.cell) + 1
         blocked = Array(repeating: false, count: columns * rows)
         floor = blocked
-        for f in mesh.faces {
+        for (faceIndex, f) in mesh.faces.enumerated() where !excluded.contains(faceIndex) {
             let a = mesh.positions[Int(f.x)], b = mesh.positions[Int(f.y)], c = mesh.positions[Int(f.z)]
             // Points at most half a cell apart, so a big triangle (a RoomPlan
             // wall or floor) reaches every cell it crosses. A scanned
@@ -51,13 +51,25 @@ struct FloorPlan {
     /// furniture is often missed by the scan, but requiring some keeps
     /// furniture inside the room.
     func isClear(_ footprint: Footprint) -> Bool {
+        obstruction(footprint) == 0 && hasFloor(near: footprint)
+    }
+
+    /// How many points 5 cm apart inside the footprint (shrunk by 8 cm, as
+    /// for `isClear`) land where something stands. Zero means clear.
+    func obstruction(_ footprint: Footprint) -> Int {
         let inner = SIMD2(max(footprint.half.x - 0.08, 0.05), max(footprint.half.y - 0.08, 0.05))
         let step = Self.cell / 2
+        var count = 0
         for z in stride(from: -inner.y, through: inner.y, by: step) {
             for x in stride(from: -inner.x, through: inner.x, by: step) {
-                if let i = index(footprint.point(x, z)), blocked[i] { return false }
+                if let i = index(footprint.point(x, z)), blocked[i] { count += 1 }
             }
         }
+        return count
+    }
+
+    /// Whether there's scanned floor in the footprint or within 20 cm of it.
+    func hasFloor(near footprint: Footprint) -> Bool {
         let outer = footprint.half + 0.2
         for z in stride(from: -outer.y, through: outer.y, by: Self.cell) {
             for x in stride(from: -outer.x, through: outer.x, by: Self.cell) {
@@ -65,6 +77,25 @@ struct FloorPlan {
             }
         }
         return false
+    }
+
+    /// Whether the footprint lies over scanned floor. Unlike `isClear`, this
+    /// deliberately ignores furniture and walls; it is used for ceiling
+    /// fixtures whose projection may be above a table or sofa.
+    func isInside(_ footprint: Footprint) -> Bool {
+        let inset = SIMD2(max(footprint.half.x - 0.04, 0.02), max(footprint.half.y - 0.04, 0.02))
+        let samples = [SIMD2<Float>(0, 0), SIMD2(-inset.x, -inset.y), SIMD2(inset.x, -inset.y),
+                       SIMD2(inset.x, inset.y), SIMD2(-inset.x, inset.y)]
+        return samples.allSatisfy { offset in
+            if let i = index(footprint.point(offset.x, offset.y)), floor[i] { return true }
+            // Sparse LiDAR floors often miss a cell; accept one within 20 cm.
+            for z in stride(from: -Float(0.2), through: Float(0.2), by: Self.cell) {
+                for x in stride(from: -Float(0.2), through: Float(0.2), by: Self.cell) {
+                    if let i = index(footprint.point(offset.x + x, offset.y + z)), floor[i] { return true }
+                }
+            }
+            return false
+        }
     }
 }
 

@@ -8,6 +8,10 @@ import SwiftUI
 @MainActor
 final class WalkAroundCapture: ObservableObject {
     enum Phase: Equatable {
+        /// Waiting for Start: the camera isn't running.
+        case ready
+        /// Start was tapped and Object Capture is setting up.
+        case starting
         case capturing
         case reconstructing(Double)
         case done
@@ -15,7 +19,7 @@ final class WalkAroundCapture: ObservableObject {
     }
 
     @Published private(set) var session: ObjectCaptureSession?
-    @Published private(set) var phase = Phase.capturing
+    @Published private(set) var phase = Phase.ready
     @Published private(set) var modelURL: URL?
     /// The first photo, for the model to pop out of.
     @Published private(set) var backdrop: UIImage?
@@ -27,8 +31,20 @@ final class WalkAroundCapture: ObservableObject {
 
     static var isSupported: Bool { ObjectCaptureSession.isSupported }
 
+    /// Starts a capture from the Start button. Object Capture's camera view
+    /// takes a few seconds to set up, on the main thread, so the spinner goes
+    /// up first; that's also why opening the mode doesn't start it.
+    func start() {
+        guard phase == .ready else { return }
+        phase = .starting
+        Task {
+            try? await Task.sleep(for: .milliseconds(100))
+            begin()
+        }
+    }
+
     /// Starts a capture unless one is running or a model is being built.
-    func begin() {
+    private func begin() {
         guard Self.isSupported, session == nil else { return }
         if case .reconstructing = phase { return }
         let formatter = DateFormatter()
@@ -77,13 +93,14 @@ final class WalkAroundCapture: ObservableObject {
         // Photos of a capture that was never finished can't make a model.
         if let folder { try? FileManager.default.removeItem(at: folder) }
         folder = nil
+        phase = .ready
     }
 
     func restart() {
         end()
         session = nil
-        phase = .capturing
-        begin()
+        phase = .ready
+        start()
     }
 
     private func reconstruct() async {
@@ -163,8 +180,18 @@ struct WalkAroundControls: View {
                             .buttonStyle(.borderedProminent)
                     }
                     .tint(.white)
-                case .capturing:
-                    ProgressView()
+                case .ready:
+                    Text("Walk round an object with the phone; the model is built on your iPhone.").label()
+                    Button("Start Capture", systemImage: "camera.viewfinder", action: capture.start)
+                        .buttonStyle(.borderedProminent)
+                        .tint(.white)
+                        .foregroundStyle(.black)
+                case .starting, .capturing:
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text("Starting the camera")
+                    }
+                    .label()
                 }
             }
         }

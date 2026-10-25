@@ -318,7 +318,7 @@
 				INFOPLIST_FILE = "RoomTwin-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = RoomTwin;
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
-				INFOPLIST_KEY_NSCameraUsageDescription = "RoomTwin uses the camera and LiDAR scanner to build a 3D model of your room.";
+				INFOPLIST_KEY_NSCameraUsageDescription = "RoomTwin uses the camera and LiDAR scanner to build a 3D room, align furniture, and track your hand on-device.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "RoomTwin listens when you tap Talk, so you can ask it to add furniture to your scan.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -354,7 +354,7 @@
 				INFOPLIST_FILE = "RoomTwin-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = RoomTwin;
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
-				INFOPLIST_KEY_NSCameraUsageDescription = "RoomTwin uses the camera and LiDAR scanner to build a 3D model of your room.";
+				INFOPLIST_KEY_NSCameraUsageDescription = "RoomTwin uses the camera and LiDAR scanner to build a 3D room, align furniture, and track your hand on-device.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "RoomTwin listens when you tap Talk, so you can ask it to add furniture to your scan.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;

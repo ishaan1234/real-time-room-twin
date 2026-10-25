@@ -2,7 +2,9 @@ import SwiftUI
 
 /// The overlay's content: nothing while waiting; when a model arrives the
 /// screen greys out and the model flies up from the bottom edge, lands and
-/// spins. Drag it to turn it and scroll or pinch to zoom.
+/// spins. Drag it to turn it and scroll or pinch to zoom. A preloaded model
+/// waits loaded just below the bottom edge, and the same view flies up when
+/// it's shown, so nothing has to load then.
 struct LandingView: View {
     @ObservedObject var viewer: Viewer
 
@@ -12,10 +14,11 @@ struct LandingView: View {
                 .opacity(viewer.arrival == nil ? 0 : 0.45)
                 .contentShape(Rectangle())
                 .onTapGesture(perform: viewer.dismiss)
-            if let arrival = viewer.arrival {
-                LandingModel(arrival: arrival, shakes: viewer.shakes)
-                    .id(arrival.id)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            ForEach(viewer.models) { model in
+                LandingModel(arrival: model, isShown: model.id == viewer.arrival?.id, shakes: viewer.shakes) {
+                    viewer.stagedIsReady(model.id)
+                }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
         .animation(.easeInOut(duration: 0.4), value: viewer.arrival)
@@ -25,7 +28,10 @@ struct LandingView: View {
 
 private struct LandingModel: View {
     let arrival: Viewer.Arrival
+    /// False while it's staged, out of sight below the screen.
+    let isShown: Bool
     let shakes: Int
+    let onReady: () -> Void
     @State private var landed = false
 
     var body: some View {
@@ -42,7 +48,7 @@ private struct LandingModel: View {
                     .opacity(landed ? 1 : 0)
                     .scaleEffect(landed ? 1 : 0.3)
                     .allowsHitTesting(false)
-                SpinningModel(url: arrival.model)
+                SpinningModel(url: arrival.model, isPlaying: isShown, onReady: onReady)
                     .frame(width: side, height: side)
                     .scaleEffect(landed ? 1 : 0.55)
                     .modifier(Shake(animatableData: CGFloat(shakes)))
@@ -61,9 +67,12 @@ private struct LandingModel: View {
                 .allowsHitTesting(false)
             }
         }
-        .onAppear {
-            withAnimation(.spring(response: 0.8, dampingFraction: 0.6)) { landed = true }
-        }
+        .onAppear { if isShown { land() } }
+        .onChange(of: isShown) { _, shown in if shown { land() } }
+    }
+
+    private func land() {
+        withAnimation(.spring(response: 0.8, dampingFraction: 0.6)) { landed = true }
     }
 }
 

@@ -33,6 +33,20 @@ final class Account: ObservableObject {
         }
     }
 
+    struct SavedRoomLayout: Identifiable, Decodable {
+        let id: UUID
+        let name: String
+        let modelPath: String
+        let plyPath: String
+        let jsonPath: String
+        let createdAt: String
+
+        enum CodingKeys: String, CodingKey {
+            case id, name
+            case modelPath = "model_path", plyPath = "ply_path", jsonPath = "json_path", createdAt = "created_at"
+        }
+    }
+
     struct Failure: LocalizedError {
         let errorDescription: String?
     }
@@ -49,6 +63,8 @@ final class Account: ObservableObject {
     private static let sessionKey = "account-session"
     private static let cache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("MyObjects")
+    private static let roomCache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("SavedRooms")
 
     init() {
         session = Keychain.read(Self.sessionKey).flatMap { try? JSONDecoder().decode(Session.self, from: $0) }
@@ -79,6 +95,7 @@ final class Account: ObservableObject {
         session = nil
         Keychain.write(Self.sessionKey, nil)
         try? FileManager.default.removeItem(at: Self.cache)
+        try? FileManager.default.removeItem(at: Self.roomCache)
         if let token {
             Task { _ = try? await call("auth/v1/logout", method: "POST", bearer: token) }
         }
@@ -166,6 +183,50 @@ final class Account: ObservableObject {
     func thumbnail(for object: SavedObject) async -> UIImage? {
         guard let path = object.thumbPath else { return nil }
         return (try? await call("storage/v1/object/authenticated/objects/\(path)")).flatMap(UIImage.init(data:))
+    }
+
+    // MARK: Saved room layouts
+
+    func roomLayouts() async throws -> [SavedRoomLayout] {
+        let data = try await call("rest/v1/room_layouts?select=id,name,model_path,ply_path,json_path,created_at&order=created_at.desc")
+        return try JSONDecoder().decode([SavedRoomLayout].self, from: data)
+    }
+
+    /// Uploads the edited room model together with the raw PLY and RoomPlan's
+    /// semantic JSON, then creates the row owned by the signed-in user.
+    func saveRoomLayout(model: URL, ply: URL, json: URL, name: String) async throws {
+        guard let user = session?.userID else { throw Failure(errorDescription: "Log in first.") }
+        let folder = "\(user)/\(UUID().uuidString.lowercased())"
+        let modelPath = "\(folder)/room.usdz"
+        let plyPath = "\(folder)/room.ply"
+        let jsonPath = "\(folder)/room.json"
+        try await call("storage/v1/object/room-layouts/\(modelPath)", method: "POST",
+                       body: try Data(contentsOf: model), contentType: "model/vnd.usdz+zip")
+        try await call("storage/v1/object/room-layouts/\(plyPath)", method: "POST",
+                       body: try Data(contentsOf: ply), contentType: "application/octet-stream")
+        try await call("storage/v1/object/room-layouts/\(jsonPath)", method: "POST",
+                       body: try Data(contentsOf: json), contentType: "application/json")
+        try await call("rest/v1/room_layouts", method: "POST",
+                       json: ["name": name, "model_path": modelPath, "ply_path": plyPath, "json_path": jsonPath])
+    }
+
+    /// The room's USDZ and RoomPlan JSON, downloaded once and then kept on the phone.
+    func roomFiles(for layout: SavedRoomLayout) async throws -> (model: URL, json: URL) {
+        let folder = Self.roomCache.appendingPathComponent(layout.id.uuidString)
+        let model = folder.appendingPathComponent("room.usdz"), json = folder.appendingPathComponent("room.json")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for (file, path) in [(model, layout.modelPath), (json, layout.jsonPath)]
+        where !FileManager.default.fileExists(atPath: file.path) {
+            try await call("storage/v1/object/authenticated/room-layouts/\(path)").write(to: file, options: .atomic)
+        }
+        return (model, json)
+    }
+
+    func delete(_ layout: SavedRoomLayout) async throws {
+        try await call("rest/v1/room_layouts?id=eq.\(layout.id.uuidString.lowercased())", method: "DELETE")
+        try await call("storage/v1/object/room-layouts", method: "DELETE",
+                       json: ["prefixes": [layout.modelPath, layout.plyPath, layout.jsonPath]])
+        try? FileManager.default.removeItem(at: Self.roomCache.appendingPathComponent(layout.id.uuidString))
     }
 
     private static func smallJPEG(_ image: UIImage) -> Data? {

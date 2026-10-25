@@ -35,7 +35,7 @@ struct Wall {
 /// RoomPlan's are wound counter-clockwise seen from inside the room, so face
 /// normals point into the room.
 enum WallFinder {
-    static func walls(in mesh: MeshSnapshot, floorY: Float) -> [Wall] {
+    static func walls(in mesh: MeshSnapshot, floorY: Float, excludingFaces excluded: Set<Int> = []) -> [Wall] {
         struct Face {
             let index: Int
             let angle: Float
@@ -43,7 +43,7 @@ enum WallFinder {
             let area: Float
         }
         var vertical: [Face] = []
-        for (i, f) in mesh.faces.enumerated() {
+        for (i, f) in mesh.faces.enumerated() where !excluded.contains(i) {
             let a = mesh.positions[Int(f.x)], b = mesh.positions[Int(f.y)], c = mesh.positions[Int(f.z)]
             let n = simd_cross(b - a, c - a)
             let length = simd_length(n)

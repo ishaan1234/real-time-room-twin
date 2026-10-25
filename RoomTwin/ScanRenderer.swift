@@ -102,6 +102,8 @@ final class ScanRenderer: NSObject, MTKViewDelegate {
 
     func start() {
         let configuration = ARWorldTrackingConfiguration()
+        // Depth only: the reconstruction here is our own, so ARKit's planes and
+        // mesh would only spend CPU.
         configuration.frameSemantics = [.sceneDepth]
         session.run(configuration)
     }

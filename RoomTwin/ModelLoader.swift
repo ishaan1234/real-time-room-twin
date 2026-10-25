@@ -19,8 +19,9 @@ enum ModelLoader {
         if let height, abs(Float(hi.z - lo.z) - height) < abs(Float(hi.y - lo.y) - height) {
             content.simdOrientation = simd_quatf(angle: -.pi / 2, axis: SIMD3(1, 0, 0))
         }
+        let assetFolder = url.deletingLastPathComponent()
         content.enumerateHierarchy { node, _ in
-            node.geometry?.materials.forEach(repair)
+            node.geometry?.materials.forEach { repair($0, relativeTo: assetFolder) }
         }
         if let fitHeight {
             let (low, high) = content.boundingBox
@@ -38,16 +39,20 @@ enum ModelLoader {
     /// download small) load as empty paths, which render black. Drop them,
     /// make the material non-metallic, and use the roughness JPEG beside
     /// the colour map if there is one.
-    private static func repair(_ material: SCNMaterial) {
+    private static func repair(_ material: SCNMaterial, relativeTo folder: URL) {
         func file(_ contents: Any?) -> URL? {
-            guard let path = contents as? String, !path.isEmpty else { return contents as? URL }
-            return URL(fileURLWithPath: path)
+            if let url = contents as? URL {
+                return url.isFileURL && !url.path.hasPrefix("/") ? folder.appendingPathComponent(url.path) : url
+            }
+            guard let path = contents as? String, !path.isEmpty else { return nil }
+            if path.hasPrefix("file://"), let url = URL(string: path) { return url }
+            return path.hasPrefix("/") ? URL(fileURLWithPath: path) : folder.appendingPathComponent(path)
         }
         func exists(_ url: URL?) -> Bool {
             url.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
         }
-        if let diffuse = file(material.diffuse.contents), exists(diffuse) {
-            material.diffuse.contents = diffuse
+        if let diffuse = file(material.diffuse.contents) {
+            material.diffuse.contents = exists(diffuse) ? diffuse : PlatformColor(white: 0.72, alpha: 1)
         }
         for property in [material.normal, material.metalness, material.roughness, material.ambientOcclusion]
         where property.contents is String && !exists(file(property.contents)) {
@@ -62,5 +67,6 @@ enum ModelLoader {
             }
             material.roughness.contents = exists(rough) ? rough : 0.8
         }
+        material.lightingModel = .physicallyBased
     }
 }

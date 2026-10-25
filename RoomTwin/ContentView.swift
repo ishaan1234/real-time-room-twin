@@ -12,12 +12,26 @@ struct ContentView: View {
     @State private var mode = Mode.room
     /// Asking which kind of room scan to start.
     @State private var choosingScan = false
+    @State private var showingSavedRooms = false
+    /// Which kind of object capture the Object tab opens on.
+    @State private var objectMode = Mode.walkAround
+    @State private var showingSavedObjects = false
+    /// An object opened from My Objects, being shown.
+    @State private var openedObject: OpenedObject?
+    @EnvironmentObject private var account: Account
     /// The model AR Quick Look is showing, if any.
     @State private var arModel: URL?
     @Environment(\.scenePhase) private var scenePhase
 
+    /// Room, or one of Object's two kinds of capture.
     private enum Mode {
         case room, photo, walkAround
+    }
+
+    private struct OpenedObject {
+        let model: URL
+        let picture: UIImage?
+        let name: String
     }
 
     var body: some View {
@@ -51,14 +65,18 @@ struct ContentView: View {
                     WalkAroundControls(capture: walk)
                 }
             }
+            // AR Edit's view is see-through, down to the camera.
+            .opacity(scan.isARPreviewActive ? 0 : 1)
             reveal
-            if let preview = scan.preview {
+            if scan.isPreviewOpen, let preview = scan.preview {
                 ScanPreview(scene: preview, isExporting: scan.isExporting, onExport: scan.export,
-                            onClose: scan.closePreview)
+                            onClose: scan.closePreview, arSession: scan.arSession,
+                            onARModeChanged: scan.setARPreviewActive)
                     .transition(.opacity)
-            } else if let preview = roomPlan.preview {
+            } else if roomPlan.isPreviewOpen, let preview = roomPlan.preview {
                 ScanPreview(scene: preview, isExporting: roomPlan.isExporting, onExport: roomPlan.export,
-                            onClose: roomPlan.closePreview)
+                            onClose: roomPlan.closePreview, arSession: nil,
+                            onARModeChanged: { _ in }, handTracking: true)
                     .transition(.opacity)
             }
             if let message = scan.errorMessage {
@@ -80,8 +98,9 @@ struct ContentView: View {
             scan.setActive(phase == .active)
         }
         .onChange(of: mode) { old, new in
+            if new != .room { objectMode = new }
             scan.setObjectMode(new != .room)
-            if new == .walkAround { walk.begin() } else if old == .walkAround { walk.end() }
+            if old == .walkAround { walk.end() }
         }
         .onChange(of: cameraPaused) { _, paused in
             scan.setCameraPaused(paused)
@@ -99,16 +118,23 @@ struct ContentView: View {
     }
 
     /// Object Capture, RoomPlan and AR Quick Look need the camera to
-    /// themselves, and the preview doesn't need it.
+    /// themselves. A detailed-mesh preview keeps ARKit tracking quietly so
+    /// AR Edit can retain the scan's exact world origin.
     private var cameraPaused: Bool {
-        mode == .walkAround || arModel != nil || scan.preview != nil
-            || (mode == .room && roomPlan.captureView != nil) || roomPlan.preview != nil
+        mode == .walkAround || arModel != nil
+            || (mode == .room && roomPlan.captureView != nil) || roomPlan.isPreviewOpen
     }
 
     /// A finished model popping out of its picture.
     @ViewBuilder
     private var reveal: some View {
-        if mode == .photo, let model = objects.revealURL {
+        if mode != .room, let opened = openedObject {
+            ModelReveal(model: opened.model, backdrop: opened.picture, origin: CGPoint(x: 0.5, y: 0.5),
+                        sender: sender, onAR: { arModel = opened.model }, onClose: { openedObject = nil },
+                        savedName: opened.name)
+                .id(opened.model)
+                .transition(.opacity)
+        } else if mode == .photo, let model = objects.revealURL {
             ModelReveal(model: model, backdrop: objects.photo, origin: objects.tap ?? CGPoint(x: 0.5, y: 0.5),
                         sender: sender, onAR: { arModel = model }, onClose: { objects.revealURL = nil })
                 .id(model)
@@ -121,18 +147,43 @@ struct ContentView: View {
         }
     }
 
+    /// Room or Object on top; under Object, Walk Around or Picture, and the
+    /// objects already saved to the account.
     private var modePicker: some View {
-        Picker("Mode", selection: $mode) {
-            Text("Room").tag(Mode.room)
-            Text("Photo").tag(Mode.photo)
-            Text("Walk Around").tag(Mode.walkAround)
+        VStack(spacing: 6) {
+            Picker("Mode", selection: Binding(get: { mode != .room }, set: { mode = $0 ? objectMode : .room })) {
+                Text("Room").tag(false)
+                Text("Object").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 220)
+            if mode != .room {
+                HStack(spacing: 8) {
+                    Picker("Capture", selection: $mode) {
+                        Text("Walk Around").tag(Mode.walkAround)
+                        Text("Picture").tag(Mode.photo)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 190)
+                    Button("My Objects", systemImage: "shippingbox") { showingSavedObjects = true }
+                        .font(.footnote.weight(.semibold))
+                        .buttonStyle(.bordered)
+                        .tint(.primary)
+                }
+                .controlSize(.small)
+            }
         }
-        .pickerStyle(.segmented)
-        .frame(width: 300)
         .padding(4)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
         .disabled(scan.isBusy || roomPlan.isBusy)
         .padding(.top, 8)
+        .animation(.easeInOut(duration: 0.2), value: mode == .room)
+        .sheet(isPresented: $showingSavedObjects) {
+            SavedObjectsSheet { object, picture in
+                let model = try await account.modelFile(for: object)
+                openedObject = OpenedObject(model: model, picture: picture, name: object.name)
+            }
+        }
     }
 
     private var roomControls: some View {
@@ -161,22 +212,36 @@ struct ContentView: View {
     }
 
     private var startButton: some View {
-        Button {
-            if RoomPlanScan.isSupported { choosingScan = true } else { scan.startScanning() }
-        } label: {
-            Label("Start Scan", systemImage: "record.circle")
-                .font(.headline)
-                .padding(.horizontal, 28)
-                .frame(height: 56)
+        VStack(spacing: 12) {
+            Button {
+                if RoomPlanScan.isSupported { choosingScan = true } else { scan.startScanning() }
+            } label: {
+                Label("Start Scan", systemImage: "record.circle")
+                    .font(.headline)
+                    .padding(.horizontal, 28)
+                    .frame(height: 56)
+            }
+            .foregroundStyle(.white)
+            .background(Color.red, in: Capsule())
+            .confirmationDialog("What kind of scan?", isPresented: $choosingScan, titleVisibility: .visible) {
+                Button("Detailed Mesh", action: scan.startScanning)
+                Button("Room Layout (RoomPlan)", action: roomPlan.start)
+            } message: {
+                Text("Detailed Mesh captures every surface in colour. Room Layout finds the walls, doors, windows "
+                     + "and furniture, and fills in furniture from your library.")
+            }
+            Button("Saved Rooms", systemImage: "icloud.and.arrow.down") { showingSavedRooms = true }
+                .font(.subheadline.weight(.semibold))
+                .padding(.horizontal, 18)
+                .frame(height: 40)
+                .background(.regularMaterial, in: Capsule())
+                .foregroundStyle(.primary)
+                .disabled(roomPlan.isBusy)
         }
-        .foregroundStyle(.white)
-        .background(Color.red, in: Capsule())
-        .confirmationDialog("What kind of scan?", isPresented: $choosingScan, titleVisibility: .visible) {
-            Button("Detailed Mesh", action: scan.startScanning)
-            Button("Room Layout (RoomPlan)", action: roomPlan.start)
-        } message: {
-            Text("Detailed Mesh captures every surface in colour. Room Layout finds the walls, doors, windows "
-                 + "and furniture, and fills in furniture from your library.")
+        .sheet(isPresented: $showingSavedRooms) {
+            SavedRoomsSheet { layout in
+                try await roomPlan.open(layout, from: account)
+            }
         }
     }
 

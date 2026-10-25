@@ -39,7 +39,11 @@ enough light or texture, still starting up).
   turn, pinch to zoom, and use two fingers to pan. **Walk** puts you where the phone was when you
   tapped View, at the same height. The stick moves you, and dragging anywhere else turns your
   head. The orange marker in Orbit shows where you are. **Close** goes back to the camera, and
-  **Scan** carries on adding to the same scan. **Talk** lets you add furniture by voice (see below).
+  **Scan** carries on adding to the same scan. **AR Edit** reuses the live ARKit/LiDAR session and
+  overlays the editable furniture at its scanned world position. Turn on **Hand Tracking**, aim
+  the cursor at a piece, pinch thumb and index finger to grab, move your hand, and open the pinch
+  to release. Undo/redo records each released hand move. **Talk** lets you add furniture by voice
+  (see below).
 - **Export** writes the scan in two formats and opens the share sheet:
   - `.usdz` previews with Quick Look (spacebar in Finder, or tap it in the Files app).
   - `.ply` is for MeshLab or Blender.
@@ -52,10 +56,11 @@ The app opens on a login screen: a username and password, nothing else. **New he
 account** makes one. The session stays in the phone's Keychain, so you only log in once. The
 person icon at the top left shows who's logged in and has **Log Out**.
 
-An account holds the objects you scan. After Photo or Walk Around builds a model, **Save to My
-Objects** names it and uploads it with its photo. In a room preview, **My Objects** lists them; tap
-one and it stands on the floor where you're looking. The voice agent doesn't see these: they're
-only added with the button.
+An account holds the objects and room layouts you scan. After Photo or Walk Around builds a model,
+**Save to My Objects** names it and uploads it with its photo. In a room preview, **My Objects**
+lists them; tap one and it stands on the floor where you're looking. The voice agent doesn't see
+these: they're only added with the button. After finishing a Room Layout scan, **Save to Account**
+uploads its edited USDZ, raw PLY and RoomPlan JSON to the signed-in user's private storage.
 
 Accounts live on Supabase, which the app calls directly, so there's no server of our own. Set it
 up once:
@@ -64,10 +69,10 @@ up once:
    **Confirm email** off. Usernames become placeholder addresses (`name@users.roomtwin.app`)
    that never get mail.
 2. Put `SUPABASE_URL`, `SUPABASE_ANON_KEY` and `SUPABASE_DB_URL` (Connect › URI) in `.env.local`.
-3. Run `python3 Accounts/setup_supabase.py`. It creates the `objects` table and the private
-   `objects` file bucket (`Accounts/schema.sql`), and writes `RoomTwin/supabase.json` for the
-   app. Then it checks sign-up, upload, save, list and delete with a throwaway user. Rebuild the
-   app afterwards.
+3. Run `python3 Accounts/setup_supabase.py`. It creates the `objects` and `room_layouts` tables and
+   their private file buckets (`Accounts/schema.sql`), and writes `RoomTwin/supabase.json` for the
+   app. Then it checks both upload/save/list/delete paths with a throwaway user. Rebuild the app
+   afterwards.
 
 The anon key in the app can only do what row-level security allows: each user reads, adds and
 deletes their own rows, and files under a folder named after their user ID. The database URL is
@@ -75,8 +80,10 @@ only used by the setup script and never goes into the app.
 
 ## Furnish by voice
 
-In the room preview, tap **Talk** and say what you want. Tap again to hang up. A conversation also
-ends by itself after 3 minutes.
+In the room preview, tap **Talk** and say one command. Talk is one-shot: the agent performs that
+single request, answers with one concise result such as **“Done — I moved the table to the left.”**,
+and disconnects as soon as the reply finishes. It never waits for a second command in the same paid
+voice session.
 
 - **"Hey, can you add a chair"** stands one on the floor where the middle of the screen points,
   facing you.
@@ -87,11 +94,35 @@ ends by itself after 3 minutes.
   others go beside it or on it. **"Put a plant on the table"** sets it on top.
 - **"Make the walls red brick"** textures every wall; **"this wall"** only the one in view.
   **"Put the walls back"** undoes it.
-- **"Remove the lamp"** takes it away. With no name, the latest piece goes.
+- **"Make the floor oak"** changes only the ground; **"make the sofa red velvet"** changes an
+  added object's material; **"make the table 80 centimetres tall"** resizes it without allowing
+  it to overlap another object.
+- **"Add a ceiling light"** hangs it from the ceiling. Lamps and light fixtures emit light, and
+  requests such as **"make the room warmer and brighter"** tune the whole lighting rig.
+- **"Add a floating bookshelf on the wall"** mounts one above the floor instead of standing it on
+  the ground; the wall placement checks its full width and height before accepting the spot.
+- RoomPlan furniture is editable too: **"move chair 2 left"**, **"make the scanned table walnut"**,
+  **"replace the sofa with a leather sofa"**, resize it, or remove it. Detected furniture is kept
+  upright even when RoomPlan reports a small pitch or roll beside a wall.
+- **"Enclose the room with a ceiling and close the open wall"** adds an exportable ceiling and
+  fills missing boundary walls; either part can be removed again by voice.
+- **"Remove the lamp"** takes it away. With no name, the latest editable piece goes.
 
 Everything stands upright on the floor, and each spot is checked first. If a wall, table or
 earlier piece is in the way, it moves to the nearest clear floor you can see. If there's no room,
 the agent says so.
+
+You can edit without voice as well. Tap any detected RoomPlan object or added model in Orbit/Walk
+to select it, then use the move, rotate, smaller, larger and delete controls. **Add** opens the
+signed-in user's saved object library.
+
+For hand editing, make a **Detailed Mesh** scan, add at least one editable object, open **View › AR
+Edit**, and enable **Hand Tracking**. Vision detects one hand entirely on-device at up to 15 FPS;
+the render/camera loop remains 60 FPS. Pinch detection is normalized to palm size, confirmed across
+two frames, and uses a wider release threshold. Furniture moves on a stable floor, wall, or
+camera-facing plane with the same collision checks as other edits. ARKit plane raycasts validate
+the initial anchor; LiDAR depth is not treated as fingertip depth. A lost hand is tolerated briefly,
+then the last valid placement is released safely.
 
 **Where the models come from.** Poly Haven first: its models are CC0, true to scale and all
 face the same way. The app downloads them at 1k (about a megabyte, a second or two). When Poly
@@ -101,11 +132,15 @@ shows under the buttons, as CC BY requires. Wall textures are Poly Haven's, tile
 size. The preview says "Powered by Poly Haven", as its API terms ask.
 
 **How it works.** An ElevenLabs agent listens and answers; Claude Haiku 4.5 decides what to do.
-Its four tools run in the app: `add_object` (what, an estimated height, placement, facing),
-`remove_object`, `set_wall_texture` and `reset_walls`. The app finds the walls itself, as large
+Its tools run in the app: adding/removing/resizing objects, changing wall/floor/object materials,
+and tuning lighting. The app finds the walls itself, as large
 vertical planes along the room's two main directions, so it works on mesh scans and RoomPlan rooms
 alike. A mesh scan needs its walls actually scanned, though: one that's mostly furniture has few
 walls to stand things against.
+
+Preview edits remain in place after closing and reopening View. USDZ export contains the edited
+walls and floor, added objects, their material and size changes, and the room lights; PLY remains
+the raw vertex-colour scan because that format has no SceneKit materials or light nodes.
 
 Set it up once on the Mac:
 
@@ -119,7 +154,8 @@ Set it up once on the Mac:
    into its Keychain and deletes the copy.
 
 The phone never gets the ElevenLabs key. The agent is public, so a leaked ID could start
-conversations; the limits of 3 minutes each and 50 a day cap what that could cost.
+conversations; calls now end after 12 seconds of server-side silence, the app hangs up immediately
+after its one short answer, and hard limits of 60 seconds each, 25 a day and one at a time cap cost.
 
 ## Room Layout: RoomPlan
 
@@ -130,13 +166,18 @@ counts what it found. **Cancel** drops the scan.
 
 The finished room is built from RoomPlan's boxes: flat walls with doors, windows and openings cut
 out, doors and windows as panels, and the floor. Furniture RoomPlan labels as a chair, sofa or table
-gets the matching model from `RoomTwin/Library`, stretched to the size RoomPlan measured. Anything
+gets the matching model from `RoomTwin/Library`, stretched to the size RoomPlan measured. Sloped or
+gabled wall tops and their top caps are retained in Orbit and Walk rather than flattened. Anything
 else is a coloured box. Then the same buttons as a mesh scan:
 
-- **View** opens the room in the same 3D preview, with Orbit, Walk and Talk.
+- **View** opens the room in the same 3D preview, with Orbit, Walk and Talk. Camera-based AR Edit is
+  currently limited to Detailed Mesh scans because a finished RoomPlan capture no longer shares
+  its AR world origin with the main scanner session; touch editing remains available here.
 - **Export** shares three files from `Documents/RoomPlan-<time>/`: the room as `.usdz` and `.ply`
   (as shown in View), and RoomPlan's `.json`. The JSON lists every wall, door, window and object
   with its category, size and position.
+- **Save to Account** stores the edited USDZ plus the raw PLY and RoomPlan JSON in the current
+  user's private cloud library.
 - **New Scan** goes back to Start Scan.
 
 Room Layout scans don't record keyframes, so the Colab furniture pipeline doesn't run on them.

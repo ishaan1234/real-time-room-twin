@@ -3,7 +3,8 @@
     python3 Voice/setup_agent.py
 
 Reads ELEVENLABS_API_KEY from .env.local. The first run creates the agent and
-its client tools (add_object, remove_object, set_wall_texture, reset_walls)
+its client tools (catalogue and saved-object placement, moving, replacing, removing, resizing, materials,
+enclosure and lighting)
 and saves their IDs to .env.local; later runs update them. The tools run in
 the app, which fetches models from Poly Haven and Sketchfab: the agent only
 decides what to ask for and where it goes.
@@ -33,8 +34,19 @@ APP = os.environ.get("APP", "dev.bugatti.RoomTwinLol")
 
 PROMPT = """\
 You are the voice of RoomTwin, an iPhone app. The user is looking at a 3D scan of their room on \
-the phone and can ask you to furnish it or change its walls. The app finds the floor and walls, \
+the phone and can ask you to furnish it or change its surfaces and lighting. The app finds the floor and walls, \
 and fetches models from online libraries (Poly Haven, and Sketchfab for what Poly Haven lacks).
+
+This is a one-shot command interface. Handle exactly one user instruction per conversation. Do not \
+greet, acknowledge, narrate your work, ask a follow-up question, or speak before calling a tool. Make \
+the best safe interpretation immediately. After the tool finishes, reply with one brief natural sentence \
+of roughly 4 to 12 words that confirms the actual result, for example: "Done — I moved the table to \
+the left." On failure, give one short useful sentence such as "I couldn't find a table to move." Then stop.
+
+Each conversation may start with a contextual update listing what the user asked earlier in this session \
+and what the app did, plus the editable objects in the room now. Those earlier commands are already done: \
+never repeat them. Use them to resolve the new instruction ("make it bigger", "another one", "move that \
+lamp left", "put the sofa back"), and use the object names exactly as listed.
 
 Adding: call add_object once per piece.
 - query: a short catalogue search, the thing plus the user's style words ("floor lamp", \
@@ -45,23 +57,41 @@ Something going on_top_of a piece is tabletop-sized (plant 0.35, lamp 0.45, vase
 - placement: in_view (default) puts it on the floor where the user is looking; against_wall \
 when they say by, against or along the wall; next_to with reference when they say next to or \
 beside something added earlier; on_top_of with reference when they say on something added earlier.
+- placement on_wall mounts floating shelves, bookshelves, cabinets and sconces on the wall. Use \
+elevation_m for the bottom height (usually 1.1 to 1.5 metres). For a floating bookshelf search \
+"floating wall bookshelf" and estimate only the shelf unit's height, usually 0.3 to 0.8 metres.
+- placement ceiling hangs ceiling lights, chandeliers and other ceiling fixtures from the ceiling.
 - facing: away_from_wall for "facing out" or "facing the room" (the default against a wall); \
 toward_wall for "facing the wall"; user for "facing me"; same_as_reference to match its neighbour.
 - Several things together ("a table and a lamp by the wall"): add the biggest first, then put \
 the rest next_to or on_top_of it. A desk or table lamp goes on_top_of a table.
 - source: leave it as any unless the user names Poly Haven or Sketchfab.
-- reference can only name things added in this conversation, not furniture already in the scan.
+- reference can name RoomPlan furniture already in the scan or something added in this conversation.
 
-Removing: remove_object with the name or kind ("the lamp"); with no name it removes the latest.
+The user's own scanned or imported models live in My Objects. When they say "my", "saved", "imported", \
+or name one of their own things (for example "my Hoka shoes"), call place_saved_object instead of \
+add_object. Pass its natural name without "my". Use placement and reference normally: "put my Hoka shoes \
+on any table" means name "Hoka shoes", placement on_top_of, reference "table". The app privately \
+matches and downloads it; never search Poly Haven or Sketchfab for a user-owned object.
+
+RoomPlan's scanned furniture is editable too. The user can refer to it by category ("table", "chair 2").
+Moving: move_object with left, right, forward, backward, up or down relative to the user's current view.
+Replacing: replace_object names the existing scanned or added object and searches for its replacement.
+Removing: remove_object with the name or kind ("the lamp"); with no name it removes the latest editable object.
 Walls: set_wall_texture with a short material search ("red brick", "white plaster", \
 "wood panels"); walls is all unless they mean the one they're looking at ("this wall"). \
 reset_walls puts the scanned look back.
+Floor: set_floor_texture changes the ground material; reset_floor restores the scan.
+Objects: set_object_texture changes a scanned or added object's material. resize_object changes its absolute \
+height in metres. A name may be omitted to edit the latest editable object.
+Enclosure: set_enclosure can add/remove a ceiling and can close/remove added walls across open room boundaries. \
+Only pass the parts the user mentioned.
+Lighting: lamp and light models illuminate the room automatically. set_lighting changes the whole \
+room; brightness and warmth are both 0 to 1 (warmth 1 is warm amber, 0 is cool daylight).
 
-Each tool replies with what was actually added and where. It may be a different model from \
-the one asked for, so name what you added. Answer in one short, friendly sentence. If a tool \
-fails, say why in a few words and what to try (for example, look at open floor). Before a \
-call that may take a moment, say a few words like "Sure, one sec." Never mention tools or how \
-the app works inside.
+Tool results contain implementation details for your decision only. Never read those details aloud. \
+Never mention tools, model sources, dimensions, credits, or how the app works. The final spoken reply \
+must remain one concise sentence, normally 4 to 12 words, and say what changed.
 """
 
 
@@ -113,22 +143,69 @@ def tools():
                 "properties": {
                     "query": text("Catalogue search for the thing, e.g. 'floor lamp', 'red velvet sofa'."),
                     "height_m": {"type": "number", "description": "Its typical real height in metres."},
-                    "placement": text("Where it goes.", ["in_view", "against_wall", "next_to", "on_top_of"]),
+                    "placement": text("Where it goes.",
+                                      ["in_view", "against_wall", "next_to", "on_top_of", "on_wall", "ceiling"]),
                     "facing": text("Which way its front faces.",
                                    ["user", "away_from_wall", "toward_wall", "same_as_reference"]),
                     "reference": text("For next_to and on_top_of: the earlier-added piece, e.g. 'table'."),
+                    "elevation_m": {"type": "number",
+                                    "description": "For on_wall: bottom height above the floor in metres."},
                     "source": text("Which library to use.", ["any", "polyhaven", "sketchfab"]),
+                },
+            },
+        },
+        "ELEVENLABS_SAVED_OBJECT_TOOL_ID": {
+            "type": "client",
+            "name": "place_saved_object",
+            "description": "Places one of the signed-in user's private scanned or imported My Objects models. "
+                           "Use this, not catalogue search, when the user says my, saved or imported.",
+            "expects_response": True,
+            "response_timeout_secs": 30,
+            "parameters": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": text("Natural saved-object name, e.g. 'Hoka shoes'; omit words like my/imported."),
+                    "placement": text("Where it goes.",
+                                      ["in_view", "against_wall", "next_to", "on_top_of", "on_wall", "ceiling"]),
+                    "reference": text("For next_to or on_top_of, any matching room object, e.g. 'table'."),
                 },
             },
         },
         "ELEVENLABS_REMOVE_OBJECT_TOOL_ID": {
             "type": "client",
             "name": "remove_object",
-            "description": "Removes a piece added earlier, by name or kind; the latest if no name is given.",
+            "description": "Removes a scanned or added editable object by name or kind; the latest if omitted.",
             "expects_response": True,
             "response_timeout_secs": 10,
             "parameters": {"type": "object", "required": [],
                            "properties": {"name": text("The piece to remove, e.g. 'lamp'. Empty for the latest.")}},
+        },
+        "ELEVENLABS_MOVE_OBJECT_TOOL_ID": {
+            "type": "client",
+            "name": "move_object",
+            "description": "Moves a scanned or added object freely relative to the user's current view.",
+            "expects_response": True,
+            "response_timeout_secs": 10,
+            "parameters": {"type": "object", "required": ["direction"], "properties": {
+                "name": text("The scanned or added object to move; empty means the latest."),
+                "direction": text("Direction relative to the user's view.",
+                                  ["left", "right", "forward", "backward", "up", "down"]),
+                "distance_m": {"type": "number", "description": "Distance in metres; default 0.3."},
+            }},
+        },
+        "ELEVENLABS_REPLACE_OBJECT_TOOL_ID": {
+            "type": "client",
+            "name": "replace_object",
+            "description": "Replaces a scanned or added object with a catalogue model in the same position.",
+            "expects_response": True,
+            "response_timeout_secs": 30,
+            "parameters": {"type": "object", "required": ["query", "height_m"], "properties": {
+                "name": text("The existing object to replace, e.g. 'table' or 'chair 2'."),
+                "query": text("Catalogue search for the replacement."),
+                "height_m": {"type": "number", "description": "Replacement's typical real height in metres."},
+                "source": text("Which library to use.", ["any", "polyhaven", "sketchfab"]),
+            }},
         },
         "ELEVENLABS_WALL_TEXTURE_TOOL_ID": {
             "type": "client",
@@ -147,6 +224,67 @@ def tools():
             "description": "Takes textures off the walls, back to the scan's own colours.",
             "expects_response": True,
             "response_timeout_secs": 10,
+        },
+        "ELEVENLABS_FLOOR_TEXTURE_TOOL_ID": {
+            "type": "client",
+            "name": "set_floor_texture",
+            "description": "Covers the scanned floor with a material from Poly Haven at real size.",
+            "expects_response": True,
+            "response_timeout_secs": 20,
+            "parameters": {"type": "object", "required": ["query"], "properties": {
+                "query": text("Material search, e.g. 'oak boards', 'white marble', 'dark carpet'."),
+            }},
+        },
+        "ELEVENLABS_RESET_FLOOR_TOOL_ID": {
+            "type": "client",
+            "name": "reset_floor",
+            "description": "Restores the floor's captured appearance.",
+            "expects_response": True,
+            "response_timeout_secs": 10,
+        },
+        "ELEVENLABS_OBJECT_TEXTURE_TOOL_ID": {
+            "type": "client",
+            "name": "set_object_texture",
+            "description": "Changes the material of a scanned or added editable object.",
+            "expects_response": True,
+            "response_timeout_secs": 20,
+            "parameters": {"type": "object", "required": ["query"], "properties": {
+                "name": text("The scanned or added object to edit; empty means the latest."),
+                "query": text("Material search, e.g. 'red velvet', 'walnut wood', 'black leather'."),
+            }},
+        },
+        "ELEVENLABS_RESIZE_OBJECT_TOOL_ID": {
+            "type": "client",
+            "name": "resize_object",
+            "description": "Changes a scanned or added object's real-world size, allowing free overlap.",
+            "expects_response": True,
+            "response_timeout_secs": 10,
+            "parameters": {"type": "object", "required": ["height_m"], "properties": {
+                "name": text("The scanned or added object to resize; empty means the latest."),
+                "height_m": {"type": "number", "description": "The requested absolute height in metres."},
+            }},
+        },
+        "ELEVENLABS_LIGHTING_TOOL_ID": {
+            "type": "client",
+            "name": "set_lighting",
+            "description": "Changes the preview's room-wide brightness and colour temperature.",
+            "expects_response": True,
+            "response_timeout_secs": 10,
+            "parameters": {"type": "object", "required": [], "properties": {
+                "brightness": {"type": "number", "description": "Brightness from 0 (dim) to 1 (bright)."},
+                "warmth": {"type": "number", "description": "Colour from 0 (cool daylight) to 1 (warm amber)."},
+            }},
+        },
+        "ELEVENLABS_ENCLOSURE_TOOL_ID": {
+            "type": "client",
+            "name": "set_enclosure",
+            "description": "Adds or removes a ceiling and closes or reopens missing boundary walls.",
+            "expects_response": True,
+            "response_timeout_secs": 10,
+            "parameters": {"type": "object", "required": [], "properties": {
+                "ceiling": {"type": "boolean", "description": "True to add a ceiling, false to remove it."},
+                "open_walls": {"type": "boolean", "description": "True to close open walls, false to remove added walls."},
+            }},
         },
     }
 
@@ -188,11 +326,14 @@ def main():
                 "language": "en",
                 "prompt": {"prompt": PROMPT, "llm": "claude-haiku-4-5", "temperature": 0, "tool_ids": tool_ids},
             },
-            "conversation": {"max_duration_seconds": 180},
+            # Voice calls are billed by connection duration. End quiet calls
+            # promptly and cap accidental sessions at the API's 60-second minimum.
+            "turn": {"turn_timeout": 30, "silence_end_call_timeout": 12},
+            "conversation": {"max_duration_seconds": 60},
         },
         "platform_settings": {
             "auth": {"enable_auth": False},
-            "call_limits": {"daily_limit": 50, "agent_concurrency_limit": 1},
+            "call_limits": {"daily_limit": 25, "agent_concurrency_limit": 1},
         },
     }
     agent_id = env.get("ELEVENLABS_AGENT_ID")
