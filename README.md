@@ -199,7 +199,7 @@ authors' CC BY licences, and the app shows their credits.
 
 <div align="center">
 
-**Built with ❤️ by [tysuprawee](https://github.com/tysuprawee) and [ishaan1234](https://github.com/ishaan1234) [t-tsou](https://github.com/t-tsou)**
+**Built with ❤️ by [tysuprawee](https://github.com/tysuprawee), [ishaan1234](https://github.com/ishaan1234) and [t-tsou](https://github.com/t-tsou)**
 
 *If RoomTwin made you rethink your living room, give it a ⭐*
 
