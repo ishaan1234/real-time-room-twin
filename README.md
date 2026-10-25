@@ -2,7 +2,7 @@
 
 # 🏠 RoomTwin
 
-### Scan your room with an iPhone. Redesign it with your voice. Walk through it in VR.
+### Scan your room with an iPhone. Redesign it with your voice. Walk through it in VR. Look at furniture/Objects in AR.
 
 **A real-time digital twin of any room, from a LiDAR scan to a furnished, walkable, editable 3D space.**
 
@@ -189,13 +189,6 @@ RoomTwin/
 - API keys stay on your machine. The phone and the browser only ever get public, restricted keys.
 - Hand tracking runs on the device. Camera frames never leave it.
 
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Open an issue to discuss an idea or report a bug, or send a pull request.
-
----
 
 ## 📜 License
 
@@ -206,7 +199,7 @@ authors' CC BY licences, and the app shows their credits.
 
 <div align="center">
 
-**Built with ❤️ by [tysuprawee](https://github.com/tysuprawee) and [ishaan1234](https://github.com/ishaan1234)**
+**Built with ❤️ by [tysuprawee](https://github.com/tysuprawee) and [ishaan1234](https://github.com/ishaan1234) [t-tsou](https://github.com/t-tsou)**
 
 *If RoomTwin made you rethink your living room, give it a ⭐*
 
