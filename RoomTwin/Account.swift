@@ -188,13 +188,10 @@ final class Account: ObservableObject {
         var request = URLRequest(url: url)
         request.httpMethod = method ?? (json == nil && body == nil ? "GET" : "POST")
         request.setValue(config.key, forHTTPHeaderField: "apikey")
-        let token: String
-        if let bearer {
-            token = bearer
-        } else {
-            token = signedIn ? try await accessToken() : config.key
+        // Only a user's token goes in Authorization: newer publishable keys aren't JWTs.
+        if let token = signedIn ? try await accessToken() : bearer {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         if let json {
             request.httpBody = try JSONSerialization.data(withJSONObject: json)
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
